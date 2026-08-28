@@ -243,6 +243,12 @@ The Mac's auth token resets when you click **Reset Token (forget all)** or reins
 </details>
 
 <details>
+<summary><strong>Tablet goes black whenever an app is fullscreen on the Mac</strong></summary>
+
+This is macOS, not the stream: with **"Displays have separate Spaces"** turned off, macOS blanks every other display — including the virtual one the tablet shows — as soon as any app enters fullscreen. Turn it on in **System Settings → Desktop & Dock → Mission Control → Displays have separate Spaces**, then log out and back in. The Mac app shows a warning in its Status panel when this setting is off.
+</details>
+
+<details>
 <summary><strong>Virtual display not appearing</strong></summary>
 
 Grant Screen Recording permission: **System Preferences → Privacy & Security → Screen Recording → Enable Side Screen**

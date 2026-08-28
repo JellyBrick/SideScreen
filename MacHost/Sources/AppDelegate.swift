@@ -138,6 +138,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
 
+        // "Displays have separate Spaces" off → any fullscreen app blanks the
+        // virtual display (#50). Nothing we can do about it from capture side;
+        // surface it so the user knows why the tablet went black.
+        let separateSpaces = NSScreen.screensHaveSeparateSpaces
+        if separateSpaces != settings.displaysHaveSeparateSpaces {
+            settings.displaysHaveSeparateSpaces = separateSpaces
+            if !separateSpaces {
+                debugLog("WARNING: 'Displays have separate Spaces' is OFF — fullscreen apps on the Mac will blank the tablet (#50)")
+            }
+        }
+
         // While a wireless client is actively streaming, keep its lastConnected
         // rolling forward so the UI shows "just now". On disconnect, the
         // onClientDisconnected handler clears currentWirelessDevice — from that

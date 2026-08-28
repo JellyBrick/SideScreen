@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Tablet goes black when an app is fullscreen on the Mac (#50).** Caused by macOS's "Displays have separate Spaces" being turned off — with it off, macOS blanks every other display, including the virtual one, whenever any app enters fullscreen. The Mac app now detects this and shows a warning in the Status panel with a shortcut to the setting; the README's Troubleshooting section documents it too.
+
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming
