@@ -9,17 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned
-- mDNS auto-discovery for wireless mode
-- Audio streaming
-- Multi-touch gestures
-- Stylus/pen support
-
----
-
-<a id="0.11.3"></a>
-## [0.11.3] - 2026-09-05
-
 Picture-quality and black-screen release. Colours no longer wash out on tablets that ignore the stream's full-range flag (#55), the stream is bounded by what the tablet's decoder can actually sustain rather than the size it claims (#66, #41), the decoder is always configured for the frame it really receives under HiDPI, and the Mac host now waits for its TCP listener before calling itself started. Thanks to @meta-boy and @cwy433-png for the contributions.
 
 ### Fixed
@@ -33,10 +22,11 @@ Picture-quality and black-screen release. Colours no longer wash out on tablets 
 ### Added
 - **2304×1440** in the 16:10 resolution list, the native panel size of several 11" tablets.
 
-### Installation
-- **macOS (Homebrew)**: `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen` (or `brew upgrade --cask sidescreen`). Requires macOS 13 (Ventura) or later.
-- **macOS (manual)**: Open `SideScreen-0.11.3-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
-- **Android**: Install `SideScreen-0.11.3-android.apk` (enable "Unknown sources" if needed).
+### Planned
+- mDNS auto-discovery for wireless mode
+- Audio streaming
+- Multi-touch gestures
+- Stylus/pen support
 
 ---
 
