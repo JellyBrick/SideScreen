@@ -62,6 +62,38 @@ final class CodecLimitsTests: XCTestCase {
         XCTAssertEqual(r.height, 1200)
     }
 
+    // MARK: - Orientation-aware client limit
+
+    func testPortraitCaptureIsMeasuredAgainstTransposedLimit() {
+        // A portrait virtual display against a landscape-reported ceiling. Without
+        // transposing, 1440x2304 would shrink to 900x1440 despite the client
+        // displaying 1440x2304 natively.
+        let r = CodecLimits.clampToClientLimit(width: 1440, height: 2304, limit: (width: 2304, height: 1440))
+        XCTAssertEqual(r.width, 1440)
+        XCTAssertEqual(r.height, 2304)
+    }
+
+    func testLandscapeCaptureUsesLimitAsReported() {
+        let r = CodecLimits.clampToClientLimit(width: 2304, height: 1440, limit: (width: 2304, height: 1440))
+        XCTAssertEqual(r.width, 2304)
+        XCTAssertEqual(r.height, 1440)
+    }
+
+    func testTransposedLimitStillClampsOversizeCapture() {
+        // HiDPI portrait: 2880x4608 physical against the same landscape ceiling.
+        let r = CodecLimits.clampToClientLimit(width: 2880, height: 4608, limit: (width: 2304, height: 1440))
+        XCTAssertLessThanOrEqual(r.width, 1440)
+        XCTAssertLessThanOrEqual(r.height, 2304)
+        XCTAssertEqual(r.width % 16, 0)
+        XCTAssertEqual(r.height % 16, 0)
+    }
+
+    func testSquareCaptureIsUnaffectedByTransposition() {
+        let r = CodecLimits.clampToClientLimit(width: 1600, height: 1600, limit: (width: 2304, height: 1440))
+        XCTAssertLessThanOrEqual(r.height, 1440)
+        XCTAssertEqual(r.width, r.height)
+    }
+
     func testClientLimitPreservesAspectRatio() {
         let r = CodecLimits.clamp(width: 3840, height: 2400, maxWidth: 1920, maxHeight: 1920)
         // 16:10 in, ~16:10 out (within 16-alignment error)

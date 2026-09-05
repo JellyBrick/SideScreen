@@ -1318,7 +1318,7 @@ class DisplaySettings: ObservableObject {
 
     static let resolutionGroups: [ResolutionGroup] = [
         ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
-            "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600"
+            "1280x800", "1440x900", "1680x1050", "1920x1200", "2304x1440", "2560x1600"
         ]),
         ResolutionGroup(name: "16:9", ratio: "HD/4K", resolutions: [
             "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160"

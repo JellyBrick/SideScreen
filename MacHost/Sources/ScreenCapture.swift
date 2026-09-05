@@ -136,21 +136,25 @@ class ScreenCapture {
     /// Codec for the current encode session. Switching restarts the stream.
     private(set) var codec: StreamCodec = .hevc
 
-    /// Decoder ceiling reported by the connected client (issue #41). Nil for
-    /// legacy clients that report nothing.
+    /// Largest frame the connected client wants to receive (issue #41): the
+    /// smaller of its panel size and what its decoder can sustain at the panel
+    /// refresh rate. Nil for legacy clients that report nothing.
     private var clientDecodeLimit: (width: Int, height: Int)?
 
     /// Encode dimensions for a codec: physical display pixels, clamped to the
-    /// client's reported decoder limit when known, else to the conservative
-    /// AVC floor when streaming H.264. SCStream/CGDisplayStream scale the
-    /// capture into this size, so no virtual-display change is needed.
+    /// client's reported ceiling when known, else to the conservative AVC floor
+    /// when streaming H.264. SCStream/CGDisplayStream scale the capture into
+    /// this size, so no virtual-display change is needed.
+    ///
+    /// This is what makes HiDPI usable on a tablet: macOS renders at 2x, SCStream
+    /// downsamples to the client's ceiling before encode, and the client decodes
+    /// a frame it can sustain — sharper than a 1x capture of the same size.
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
         let phys = (displayWidth, displayHeight)
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
         if let limit = clientDecodeLimit {
-            return CodecLimits.clamp(width: phys.0, height: phys.1,
-                                     maxWidth: limit.width, maxHeight: limit.height)
+            return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: limit)
         }
         switch codec {
         case .hevc: return phys

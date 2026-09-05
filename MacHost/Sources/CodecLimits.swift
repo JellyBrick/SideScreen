@@ -37,4 +37,19 @@ enum CodecLimits {
     static func clampForAvc(width: Int, height: Int) -> (width: Int, height: Int) {
         clamp(width: width, height: height, maxWidth: avcMaxWidth, maxHeight: avcMaxHeight)
     }
+
+    /// Clamp into a client-reported ceiling, transposing the box when its
+    /// orientation differs from the capture's. Clients report the ceiling in
+    /// their panel's natural orientation, but it stands for a macroblock area
+    /// budget, which is indifferent to which side is longer.
+    static func clampToClientLimit(
+        width: Int,
+        height: Int,
+        limit: (width: Int, height: Int)
+    ) -> (width: Int, height: Int) {
+        let box = (height > width) == (limit.height > limit.width)
+            ? limit
+            : (width: limit.height, height: limit.width)
+        return clamp(width: width, height: height, maxWidth: box.width, maxHeight: box.height)
+    }
 }

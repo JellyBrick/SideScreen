@@ -988,7 +988,11 @@ class MainActivity : AppCompatActivity() {
                 // Black screen with live stats: tell the user why instead of
                 // staying silent (issue #41). Toast renders above the (black)
                 // SurfaceView; the settings panel is hidden while streaming.
-                val cap = CodecCapabilities.maxDecodeSize(mime)
+                // The sustainable size, not the decoder's advertised one — that is typically far
+                // above anything it can really output, which made this message actively misleading.
+                val panel = PanelGeometry.of(displayObj)
+                val cap =
+                    panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, it.refreshHz) }
                 runOnUiThread {
                     val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
                     android.widget.Toast
@@ -1270,7 +1274,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 log("Connecting to $host:$port...")
 
-                streamClient = StreamClient(host, port)
+                streamClient = StreamClient(host, port, applicationContext)
                 streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
                     val dec = videoDecoder
                     if (dec != null) {

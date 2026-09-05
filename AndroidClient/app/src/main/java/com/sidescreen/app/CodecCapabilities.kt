@@ -32,7 +32,7 @@ object CodecCapabilities {
      * Usable *hardware* decoder for [mime]: not an encoder, not the (too slow
      * for real-time mirroring) Google software implementation, and for HEVC
      * not one of the vendor implementations that never render to a Surface.
-     * Shared by [hasHevcDecoder] and [maxDecodeSize] so the classification
+     * Shared by [hasHevcDecoder] and [nominalMaxDecodeSize] so the classification
      * cannot drift between them. Same hardware/software split
      * VideoDecoder.findBestDecoder uses.
      */
@@ -64,38 +64,86 @@ object CodecCapabilities {
     val streamMime: String
         get() = if (hasHevcDecoder) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
 
-    private val maxDecodeSizeCache = HashMap<String, Pair<Int, Int>?>()
+    private val nominalSizeCache = HashMap<String, Pair<Int, Int>?>()
 
     /**
-     * Upper decode bounds (width × height) of the largest usable *hardware*
-     * decoder for [mime] — the software fallback is too slow for real-time
-     * mirroring to count as a ceiling. Null when nothing usable exists or the
-     * probe fails (legacy behavior: no limit advertised to the Mac).
-     * Cached per mime: enumerating MediaCodecList is not cheap and the answer
-     * never changes at runtime (same reason hasHevcDecoder is lazy).
+     * The `size` limit the largest usable *hardware* decoder for [mime] advertises. Null when
+     * nothing usable exists or the probe fails (legacy behavior: advertise no limit to the Mac).
+     * Cached per mime: enumerating MediaCodecList is not cheap and the answer never changes at
+     * runtime (same reason hasHevcDecoder is lazy).
+     *
+     * Nominal, not achievable. Vendor decoders routinely advertise a `size` far above what their
+     * `blocks-per-second` budget can sustain, and configuring above that budget succeeds and then
+     * silently never outputs a frame. Prefer [maxStreamSize] for anything the Mac will encode.
      */
-    fun maxDecodeSize(mime: String): Pair<Int, Int>? =
-        synchronized(maxDecodeSizeCache) {
-            maxDecodeSizeCache.getOrPut(mime.lowercase()) { probeMaxDecodeSize(mime) }
+    fun nominalMaxDecodeSize(mime: String): Pair<Int, Int>? =
+        synchronized(nominalSizeCache) {
+            nominalSizeCache.getOrPut(mime.lowercase()) { probeNominalSize(mime) }
         }
 
-    private fun probeMaxDecodeSize(mime: String): Pair<Int, Int>? =
+    private fun probeNominalSize(mime: String): Pair<Int, Int>? =
+        bestVideoCapabilities(mime)?.let { it.supportedWidths.upper to it.supportedHeights.upper }
+
+    /** Video capabilities of the largest usable hardware decoder for [mime]. */
+    private fun bestVideoCapabilities(mime: String): MediaCodecInfo.VideoCapabilities? =
         try {
             MediaCodecList(MediaCodecList.ALL_CODECS)
                 .codecInfos
                 .asSequence()
                 .filter { isUsableHardwareDecoder(it, mime) }
                 .mapNotNull { info ->
-                    val videoCaps =
-                        try {
-                            info.getCapabilitiesForType(mime).videoCapabilities
-                        } catch (_: Exception) {
-                            null
-                        }
-                    videoCaps?.let { it.supportedWidths.upper to it.supportedHeights.upper }
-                }
-                .maxByOrNull { (w, h) -> w.toLong() * h.toLong() }
+                    try {
+                        info.getCapabilitiesForType(mime).videoCapabilities
+                    } catch (_: Exception) {
+                        null
+                    }
+                }.maxByOrNull { it.supportedWidths.upper.toLong() * it.supportedHeights.upper.toLong() }
         } catch (_: Exception) {
             null
         }
+
+    private const val BLOCK_ALIGN = 16
+
+    /**
+     * The largest frame the Mac should ever encode for us: no larger than the panel can show, and
+     * within what the decoder sustains at [fps]. Null when no usable decoder exists or the probe
+     * fails, which leaves the legacy "advertise nothing" behavior in place.
+     *
+     * The panel is the upper bound because anything above it is downscaled on arrival anyway, so
+     * spending decode budget there buys nothing. [MediaCodecInfo.VideoCapabilities.areSizeAndRateSupported]
+     * is the check that consults `blocks-per-second`, which [nominalMaxDecodeSize] misses. Shrinks
+     * stepwise rather than solving directly because the budget counts aligned macroblocks.
+     */
+    fun maxStreamSize(
+        mime: String,
+        panelWidth: Int,
+        panelHeight: Int,
+        fps: Int,
+    ): Pair<Int, Int>? {
+        if (panelWidth <= 0 || panelHeight <= 0) return null
+        val caps = bestVideoCapabilities(mime) ?: return null
+        val rate = fps.coerceAtLeast(1).toDouble()
+
+        var w = panelWidth.coerceAtMost(caps.supportedWidths.upper)
+        var h = panelHeight.coerceAtMost(caps.supportedHeights.upper)
+        val aspect = panelWidth.toDouble() / panelHeight.toDouble()
+
+        repeat(40) {
+            val alignedW = (w / BLOCK_ALIGN) * BLOCK_ALIGN
+            val alignedH = (h / BLOCK_ALIGN) * BLOCK_ALIGN
+            if (alignedW < 256 || alignedH < 256) return null
+            val supported =
+                try {
+                    caps.areSizeAndRateSupported(alignedW, alignedH, rate)
+                } catch (_: IllegalArgumentException) {
+                    false
+                } catch (_: Exception) {
+                    return null
+                }
+            if (supported) return alignedW to alignedH
+            w = (w * 0.95).toInt()
+            h = (w / aspect).toInt()
+        }
+        return null
+    }
 }

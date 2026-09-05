@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit
 class StreamClient(
     private val host: String,
     private val port: Int,
-    private val context: Context? = null,
+    private val context: Context,
 ) {
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
@@ -180,14 +180,12 @@ class StreamClient(
         try {
             val sock = Socket()
             sock.tcpNoDelay = true
+            val cm = context.getSystemService(ConnectivityManager::class.java)
             val wifiNetwork =
-                context?.let { ctx ->
-                    val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                    cm.allNetworks.firstOrNull { net ->
-                        val caps = cm.getNetworkCapabilities(net)
-                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    }
+                cm.allNetworks.firstOrNull { net ->
+                    val caps = cm.getNetworkCapabilities(net)
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 }
             if (wifiNetwork != null) {
                 Log.i(TAG, "openWirelessSocket: binding socket to WiFi network $wifiNetwork")
@@ -394,7 +392,15 @@ class StreamClient(
     }
 
     private fun advertiseDecoderLimits() {
-        val (maxW, maxH) = CodecCapabilities.maxDecodeSize(CodecCapabilities.streamMime) ?: return
+        val mime = CodecCapabilities.streamMime
+        val panel = PanelGeometry.ofDefaultDisplay(context)
+        // Nominal limit only as a fallback: it ignores blocks-per-second, so on most devices it is
+        // far too high to protect anything.
+        val limit =
+            panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, it.refreshHz) }
+                ?: CodecCapabilities.nominalMaxDecodeSize(mime)
+                ?: return
+        val (maxW, maxH) = limit
         val w = maxW.coerceAtMost(16383)
         val h = maxH.coerceAtMost(16383)
         if (w < 256 || h < 256) return
@@ -408,7 +414,7 @@ class StreamClient(
             out.writeByte(0x80 or ((h shr 7) and 0x7F))
             out.writeByte(0x80 or (h and 0x7F))
             out.flush()
-            diagLog("Advertised decoder limit ${w}x$h for ${CodecCapabilities.streamMime}")
+            diagLog("Advertised stream limit ${w}x$h for $mime (panel=$panel)")
         }
     }
 
@@ -693,7 +699,10 @@ class StreamClient(
 
     companion object {
         private const val TAG = "StreamClient"
-        private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
+
+        // Only a desync guard — acquireBuffer allocates the real frame size, so a generous bound
+        // costs nothing. Must clear a keyframe at panel resolution and the highest offered bitrate.
+        private const val MAX_FRAME_SIZE = 32 * 1024 * 1024 // 32MB
         private const val PAIRING_READ_TIMEOUT_MS = 10_000
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
