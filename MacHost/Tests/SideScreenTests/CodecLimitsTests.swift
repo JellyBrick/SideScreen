@@ -62,6 +62,30 @@ final class CodecLimitsTests: XCTestCase {
         XCTAssertEqual(r.height, 1200)
     }
 
+    // MARK: - Frame-rate scaling of the client limit
+
+    func testLimitIsUnchangedAtOrBelowReferenceRate() {
+        let limit = (width: 2304, height: 1440)
+        XCTAssertTrue(CodecLimits.scaleLimit(limit, forFps: 60) == limit)
+        XCTAssertTrue(CodecLimits.scaleLimit(limit, forFps: 30) == limit)
+    }
+
+    func testLimitAreaHalvesAtDoubleRate() {
+        let r = CodecLimits.scaleLimit((width: 2304, height: 1440), forFps: 120)
+        // sqrt(0.5) per side => ~1629x1018, floored to 16 => 1616x1008
+        XCTAssertEqual(r.width, 1616)
+        XCTAssertEqual(r.height, 1008)
+        let areaRatio = Double(r.width * r.height) / Double(2304 * 1440)
+        XCTAssertEqual(areaRatio, 0.5, accuracy: 0.03)
+        XCTAssertEqual(r.width % 16, 0)
+        XCTAssertEqual(r.height % 16, 0)
+    }
+
+    func testScaledLimitKeepsAspect() {
+        let r = CodecLimits.scaleLimit((width: 2560, height: 1600), forFps: 90)
+        XCTAssertEqual(Double(r.width) / Double(r.height), 1.6, accuracy: 0.02)
+    }
+
     // MARK: - Orientation-aware client limit
 
     func testPortraitCaptureIsMeasuredAgainstTransposedLimit() {

@@ -154,7 +154,8 @@ class ScreenCapture {
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
         if let limit = clientDecodeLimit {
-            return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: limit)
+            let budget = CodecLimits.scaleLimit(limit, forFps: refreshRate)
+            return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: budget)
         }
         switch codec {
         case .hevc: return phys

@@ -1011,7 +1011,14 @@ class MainActivity : AppCompatActivity() {
                 // above anything it can really output, which made this message actively misleading.
                 val panel = PanelGeometry.of(displayObj)
                 val cap =
-                    panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, it.refreshHz) }
+                    panel?.let {
+                        CodecCapabilities.maxStreamSize(
+                            mime,
+                            it.width,
+                            it.height,
+                            CodecCapabilities.REFERENCE_FPS,
+                        )
+                    }
                 runOnUiThread {
                     val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
                     android.widget.Toast

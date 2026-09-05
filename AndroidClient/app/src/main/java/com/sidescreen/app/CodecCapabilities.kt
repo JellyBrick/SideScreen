@@ -105,6 +105,15 @@ object CodecCapabilities {
     private const val BLOCK_ALIGN = 16
 
     /**
+     * Frame rate the advertised stream limit is measured at. The client cannot know the Mac's
+     * frame-rate setting when it advertises (that arrives later), and measuring at the panel's
+     * peak rate would shrink the picture on 120/144 Hz tablets that stream at the 60 Hz default.
+     * The Mac scales the limit's area by 60/fps when it streams faster than this, so both sides
+     * must agree on the number (see CodecLimits.scaleLimit on the Mac).
+     */
+    const val REFERENCE_FPS = 60
+
+    /**
      * The largest frame the Mac should ever encode for us: no larger than the panel can show, and
      * within what the decoder sustains at [fps]. Null when no usable decoder exists or the probe
      * fails, which leaves the legacy "advertise nothing" behavior in place.

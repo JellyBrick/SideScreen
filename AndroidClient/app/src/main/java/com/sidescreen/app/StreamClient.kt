@@ -410,7 +410,7 @@ class StreamClient(
         // Nominal limit only as a fallback: it ignores blocks-per-second, so on most devices it is
         // far too high to protect anything.
         val limit =
-            panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, it.refreshHz) }
+            panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.REFERENCE_FPS) }
                 ?: CodecCapabilities.nominalMaxDecodeSize(mime)
                 ?: return
         val (maxW, maxH) = limit
