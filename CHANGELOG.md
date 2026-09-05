@@ -9,14 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **Tablet goes black when an app is fullscreen on the Mac (#50).** Caused by macOS's "Displays have separate Spaces" being turned off — with it off, macOS blanks every other display, including the virtual one, whenever any app enters fullscreen. The Mac app now detects this and shows a warning in the Status panel with a shortcut to the setting; the README's Troubleshooting section documents it too.
-
 ### Planned
 - mDNS auto-discovery for wireless mode
 - Audio streaming
 - Multi-touch gestures
 - Stylus/pen support
+
+---
+
+<a id="0.11.3"></a>
+## [0.11.3] - 2026-09-05
+
+Picture-quality and black-screen release. Colours no longer wash out on tablets that ignore the stream's full-range flag (#55), the stream is bounded by what the tablet's decoder can actually sustain rather than the size it claims (#66, #41), the decoder is always configured for the frame it really receives under HiDPI, and the Mac host now waits for its TCP listener before calling itself started. Thanks to @meta-boy and @cwy433-png for the contributions.
+
+### Fixed
+- **Washed-out / over-bright picture (#55).** The Mac captured full-range (0–255) video and flagged the stream accordingly, but several Android display paths (Xiaomi/HyperOS among them) apply a limited-range matrix regardless, so light greys clipped to white and shadows crushed to black. The capture is now video-range and the bitstream is tagged BT.709 explicitly — the default every decoder and GPU assumes, so it renders identically everywhere.
+- **Black screen on tablets whose decoder overstates its limit (#66, #41 follow-up).** The tablet used to advertise the decoder's nominal `size` limit (often 8192×8192), which ignores the `blocks-per-second` budget that actually binds — so a Snapdragon 680 or a HiDPI stream could be configured fine and then never output a frame. The tablet now advertises the largest frame its decoder sustains at 60 fps, no larger than its panel; the Mac scales the stream to fit (aspect preserved, transposed for portrait) and shrinks the budget further when streaming above 60 fps. The "decoder can't keep up" message now names the sustainable size instead of the nominal one. Contributed by @meta-boy.
+- **Decoder sized from the wrong resolution under HiDPI (#41).** With HiDPI on, the Mac sent the logical resolution (e.g. 2560×1600) so the overlay matched the dropdown, while feeding the tablet the doubled stream (5120×3200) — so the tablet's capability check ran against a size it never received. The display config now always carries the encoded size; the logical desktop travels in its own message and the overlay shows both when they differ, e.g. `1712x1072 (desktop 2560x1600)`. Fully backward compatible in both directions; an older tablet simply shows the encoded size. Contributed by @meta-boy.
+- **Decoder limit that arrives late is now honoured.** On a slow link or device the tablet's capability advertisement could land after the Mac had already finished protocol startup, in which case it was recorded but ignored until the next restart. The Mac now re-negotiates and re-sends the display config immediately.
+- **Server startup lifecycle.** The Mac host used to continue setting up capture and the virtual display before its TCP listener was actually ready, so a failed or delayed bind could look "started" while the tablet got nothing. Startup now waits for the listener (with a bounded timeout), fails fast with a clear message when the port is already in use, and tears down partial resources on any failure. Contributed by @cwy433-png.
+- **Tablet goes black when an app is fullscreen on the Mac (#50).** Caused by macOS's "Displays have separate Spaces" being turned off — with it off, macOS blanks every other display, including the virtual one, whenever any app enters fullscreen. The Mac app now detects this and shows a warning in the Status panel with a shortcut to the setting; the README's Troubleshooting section documents it too.
+
+### Added
+- **2304×1440** in the 16:10 resolution list, the native panel size of several 11" tablets.
+
+### Installation
+- **macOS (Homebrew)**: `brew tap tranvuongquocdat/sidescreen && brew install --cask --no-quarantine sidescreen` (or `brew upgrade --cask sidescreen`). Requires macOS 13 (Ventura) or later.
+- **macOS (manual)**: Open `SideScreen-0.11.3-mac-universal.dmg`, drag SideScreen to Applications. If Gatekeeper says "damaged"/"cannot be opened": `sudo xattr -cr /Applications/SideScreen.app`. Requires macOS 13 (Ventura) or later.
+- **Android**: Install `SideScreen-0.11.3-android.apk` (enable "Unknown sources" if needed).
 
 ---
 
