@@ -343,7 +343,14 @@ class ScreenCapture {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // Video-range (16-235) rather than full-range (0-255). VideoToolbox
+        // derives the bitstream's VUI full_range_flag from the pixel format,
+        // and several Android vendor display paths (Xiaomi/HyperOS among
+        // them) apply a limited-range YUV->RGB matrix regardless of that
+        // flag, which clips full-range highlights to white and crushes
+        // shadows (#55). Limited range is what every decoder/GPU assumes by
+        // default, so it renders identically everywhere.
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = true
         config.queueDepth = 4
         config.capturesAudio = false
@@ -665,7 +672,8 @@ class ScreenCapture {
 
         debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
 
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        // Video-range to match the SCStream path (see #55 note above).
+        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
 
         // Without kCGDisplayStreamShowCursor the fallback stream never

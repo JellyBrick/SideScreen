@@ -121,6 +121,14 @@ class VideoEncoder {
         // CBR causes over-quantization (blocky artifacts) when scene complexity spikes
         // Removed: kVTCompressionPropertyKey_ConstantBitRate
 
+        // Tag the bitstream as BT.709 explicitly so the VUI carries
+        // colour_primaries / transfer / matrix rather than "unspecified".
+        // Combined with video-range capture buffers this pins the tablet's
+        // YUV->RGB conversion to the same matrix on every vendor (#55).
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ColorPrimaries, value: kCVImageBufferColorPrimaries_ITU_R_709_2)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_TransferFunction, value: kCVImageBufferTransferFunction_ITU_R_709_2)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_YCbCrMatrix, value: kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+
         VTCompressionSessionPrepareToEncodeFrames(session)
 
         let mode = gamingBoost ? "🎮 GAMING BOOST" : quality.uppercased()
