@@ -743,6 +743,19 @@ class StreamingServer {
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
                     debugLog("Client decoder limit: \(w)x\(h)")
+                    // Arrived after the 100 ms legacy grace already finished
+                    // startup (slow link, slow device): re-negotiate now so the
+                    // limit still takes effect instead of waiting for the next
+                    // restart. The handler re-sends the display config itself
+                    // when the encode size changes.
+                    if connectionReady {
+                        debugLog("Decoder limit arrived late — re-negotiating")
+                        let before = (displayWidth, displayHeight)
+                        onCodecNegotiated?(clientIsAvcOnly ? .h264 : .hevc)
+                        if (displayWidth, displayHeight) != before {
+                            sendDisplaySize()
+                        }
+                    }
                 }
 
             case WireMessage.clientSupportsDesktopGeometry:
@@ -752,6 +765,9 @@ class StreamingServer {
                 if !clientSupportsDesktopGeometry {
                     clientSupportsDesktopGeometry = true
                     debugLog("Client reads displayConfig as the encoded size")
+                    // Late opt-in (after startup): the display config already
+                    // went out without geometry, so send it on its own.
+                    if connectionReady { sendDesktopGeometry() }
                 }
 
             default:
