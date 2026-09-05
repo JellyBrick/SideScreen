@@ -22,6 +22,13 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, payload-free: "I understand desktopGeometry, and I read
+    /// displayConfig as the encoded stream size."
+    static let clientSupportsDesktopGeometry: UInt8 = 12
+    /// Server→client, 8-byte payload: the logical desktop size, for display
+    /// only. Sent ONLY to clients that sent clientSupportsDesktopGeometry —
+    /// older clients disconnect on unknown message types.
+    static let desktopGeometry: UInt8 = 13
 }
 
 private extension NWEndpoint {
@@ -122,6 +129,11 @@ class StreamingServer {
     private var clientIsAvcOnly = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
+    /// Set when the client opts in via type 12. Gates desktopGeometry sends.
+    private var clientSupportsDesktopGeometry = false
+    /// Logical desktop size, reported alongside the encoded size for display.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
     private var inputBuffer = Data()
 
     init(port: UInt16) {
@@ -175,6 +187,7 @@ class StreamingServer {
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
+        clientSupportsDesktopGeometry = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
@@ -407,6 +420,13 @@ class StreamingServer {
         })
     }
 
+    /// The logical desktop the user picked. Purely informational: the client
+    /// must size its decoder from displayConfig, never from this.
+    func setDesktopSize(width: Int, height: Int) {
+        desktopWidth = width
+        desktopHeight = height
+    }
+
     func setDisplaySize(width: Int, height: Int, rotation: Int = 0, flipHorizontal: Bool = false, flipVertical: Bool = false) {
         displayWidth = width
         displayHeight = height
@@ -434,6 +454,20 @@ class StreamingServer {
 
         connection.send(content: data, completion: .contentProcessed { _ in })
         debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+        sendDesktopGeometry()
+    }
+
+    /// Follows every display config so the two can never disagree on screen.
+    private func sendDesktopGeometry() {
+        guard clientSupportsDesktopGeometry, let connection = connection else { return }
+        guard desktopWidth > 0, desktopHeight > 0 else { return }
+
+        var data = Data()
+        data.append(WireMessage.desktopGeometry)
+        data.append(contentsOf: withUnsafeBytes(of: Int32(desktopWidth).bigEndian) { Data($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Int32(desktopHeight).bigEndian) { Data($0) })
+        connection.send(content: data, completion: .contentProcessed { _ in })
+        debugLog("Sent desktop geometry: \(desktopWidth)x\(desktopHeight)")
     }
 
     private func startReceivingTouch() {
@@ -562,6 +596,15 @@ class StreamingServer {
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
                     debugLog("Client decoder limit: \(w)x\(h)")
+                }
+
+            case WireMessage.clientSupportsDesktopGeometry:
+                // Payload-free opt-in (same convention as types 8 and 9), sent
+                // BEFORE type 8 so it lands before finishProtocolStartup runs.
+                consumeInputBytes(1)
+                if !clientSupportsDesktopGeometry {
+                    clientSupportsDesktopGeometry = true
+                    debugLog("Client reads displayConfig as the encoded size")
                 }
 
             default:

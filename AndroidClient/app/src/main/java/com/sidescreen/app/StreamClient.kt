@@ -33,6 +33,9 @@ class StreamClient(
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
+
+    /** Logical desktop size behind the stream. Display only; never size the decoder from it. */
+    var onDesktopSize: ((Int, Int) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
 
     /** Invoked when the server confirms the stream codec (true = HEVC). */
@@ -128,6 +131,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -351,6 +355,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -371,6 +376,14 @@ class StreamClient(
                 }
                 throw WirelessConnectError.ProtocolError
             }
+        }
+    }
+
+    private fun advertiseDesktopGeometrySupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY)
+            out.flush()
+            diagLog("Advertised desktop-geometry support")
         }
     }
 
@@ -453,6 +466,13 @@ class StreamClient(
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        MESSAGE_DESKTOP_GEOMETRY -> {
+                            val dw = input.readInt()
+                            val dh = input.readInt()
+                            diagLog("Desktop geometry: ${dw}x$dh")
+                            onDesktopSize?.invoke(dw, dh)
                         }
 
                         MESSAGE_CODEC_SELECTED -> {
@@ -713,6 +733,8 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
+        private const val MESSAGE_DESKTOP_GEOMETRY = 13
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

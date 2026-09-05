@@ -59,6 +59,12 @@ class MainActivity : AppCompatActivity() {
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
+
+    // Logical desktop behind the stream, 0 when the Mac predates desktopGeometry.
+    // Shown next to the stream size; never used to size the decoder.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
+
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
@@ -920,6 +926,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Stream size first, since that is what the decoder and every other stat in this overlay
+     * describe. The desktop size is appended only when it differs, so a scaled HiDPI desktop is
+     * visible rather than silently standing in for the resolution actually being sent.
+     */
+    private fun updateResolutionOverlay() {
+        if (displayWidth <= 0 || displayHeight <= 0) return
+        val stream = "${displayWidth}x$displayHeight"
+        val differs = desktopWidth > 0 && (desktopWidth != displayWidth || desktopHeight != displayHeight)
+        binding.resolutionText.text =
+            if (differs) "$stream (desktop ${desktopWidth}x$desktopHeight)" else stream
+    }
+
     private fun shouldUseTextureView(): Boolean = displayFlipHorizontal || displayFlipVertical
 
     private fun activeVideoSurface(): Pair<Surface, Boolean>? {
@@ -1098,6 +1117,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        streamClient?.onDesktopSize = { w, h ->
+            desktopWidth = w
+            desktopHeight = h
+            runOnUiThread { updateResolutionOverlay() }
+        }
+
         streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
         streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
@@ -1109,7 +1134,7 @@ class MainActivity : AppCompatActivity() {
             displayFlipHorizontal = flipHorizontal
             displayFlipVertical = flipVertical
             runOnUiThread {
-                binding.resolutionText.text = "${width}x$height"
+                updateResolutionOverlay()
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
             }
@@ -1360,6 +1385,12 @@ class MainActivity : AppCompatActivity() {
 
                 streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
+                streamClient?.onDesktopSize = { w, h ->
+                    desktopWidth = w
+                    desktopHeight = h
+                    runOnUiThread { updateResolutionOverlay() }
+                }
+
                 streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
                     mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
                     warnIfAvcOnlyWithoutNegotiation()
@@ -1370,7 +1401,7 @@ class MainActivity : AppCompatActivity() {
                     displayFlipVertical = flipVertical
 
                     runOnUiThread {
-                        binding.resolutionText.text = "${width}x$height"
+                        updateResolutionOverlay()
                         applyRotation(rotation, flipHorizontal, flipVertical)
                         initializeDecoderForCurrentSurface()
                     }
@@ -1419,6 +1450,8 @@ class MainActivity : AppCompatActivity() {
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
+        desktopWidth = 0
+        desktopHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {
