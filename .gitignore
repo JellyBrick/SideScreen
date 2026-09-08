@@ -61,3 +61,4 @@ temp/
 
 # Local ktlint binary (CI downloads its own)
 AndroidClient/ktlint
+AndroidClient/aoabench/build/
