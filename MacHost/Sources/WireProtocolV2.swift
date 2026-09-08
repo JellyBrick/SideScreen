@@ -2,11 +2,13 @@ import Foundation
 
 /// Protocol v2 (negotiated over the v1 stream, then framed).
 ///
-/// Negotiation: the client sends v1 type 12 (payload-free — old hosts consume
+/// Negotiation: the client sends v1 type 14 (payload-free — old hosts consume
 /// one byte harmlessly, the same convention as types 8/9) BEFORE type 8. A v2
-/// host answers with v1 type 13 + [version], after which BOTH directions
-/// speak enveloped v2 exclusively. Old clients never send 12, old hosts never
-/// answer 13, so both legacy pairings keep speaking byte-identical v1.
+/// host answers with v1 type 15 + [version], after which BOTH directions
+/// speak enveloped v2 exclusively. Old clients never send 14, old hosts never
+/// answer 15, so both legacy pairings keep speaking byte-identical v1. (v1
+/// types 12/13 belong to the upstream desktop-geometry exchange and must
+/// never be reused here.)
 ///
 /// Envelope: [type u8][len u24 BE][payload len bytes]. Unknown types are
 /// skipped by length — protocol growth no longer needs the high-bit padding
@@ -17,8 +19,8 @@ import Foundation
 /// behind a multi-megabyte keyframe (head-of-line blocking).
 enum WireV2 {
     /// v1 message types used for the handshake.
-    static let negotiationRequest: UInt8 = 12
-    static let negotiationAccept: UInt8 = 13
+    static let negotiationRequest: UInt8 = 14
+    static let negotiationAccept: UInt8 = 15
     static let version: UInt8 = 2
 
     static let envelopeSize = 4
@@ -38,6 +40,7 @@ enum WireV2 {
         case videoConfig = 9    // codecId u8, nalLengthSize u8, Annex-B parameter sets
         case clientStats = 10   // reserved: client→host 1 Hz stats report
         case nop = 11           // padding (AOA uplink 512-multiple avoidance)
+        case desktopGeometry = 12 // w u32, h u32 (BE) — logical desktop, display only
     }
 
     struct FrameFlags {
@@ -121,6 +124,13 @@ enum WireV2 {
         data.append(codecId)
         data.append(nalLengthSize)
         data.append(parameterSets)
+        return data
+    }
+
+    static func encodeDesktopGeometry(width: Int, height: Int) -> Data {
+        var data = envelope(.desktopGeometry, payloadCount: 8)
+        appendBE(UInt32(width), to: &data)
+        appendBE(UInt32(height), to: &data)
         return data
     }
 

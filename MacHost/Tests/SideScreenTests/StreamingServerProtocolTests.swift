@@ -11,12 +11,12 @@ final class StreamingServerProtocolTests: XCTestCase {
     private let receiveLock = NSLock()
     private static var nextPort: UInt16 = 54871
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         Self.nextPort += 1
         server = StreamingServer(port: Self.nextPort)
         server.setDisplaySize(width: 1920, height: 1080)
-        server.start()
+        try await server.start()
 
         connection = NWConnection(
             host: .ipv4(.loopback),
@@ -27,7 +27,7 @@ final class StreamingServerProtocolTests: XCTestCase {
             if case .ready = state { ready.fulfill() }
         }
         connection.start(queue: DispatchQueue(label: "test.client"))
-        wait(for: [ready], timeout: 5)
+        await fulfillment(of: [ready], timeout: 5)
         startDraining()
     }
 
@@ -105,13 +105,13 @@ final class StreamingServerProtocolTests: XCTestCase {
     }
 
     func testV2ClientNegotiatesAndReceivesChunkedFrames() {
-        send([12, 8]) // v2 request, then metadata support (client's last v1 bytes)
+        send([14, 8]) // v2 request, then metadata support (client's last v1 bytes)
 
-        // Expect: [13][version] then v2 envelopes: videoConfig announcement +
+        // Expect: [15][version] then v2 envelopes: videoConfig announcement +
         // displayConfig = 2 + (4+2) + (4+12) = 24 bytes minimum.
         var data = waitForBytes(24)
         XCTAssertGreaterThanOrEqual(data.count, 24)
-        XCTAssertEqual(data[0], 13)
+        XCTAssertEqual(data[0], 15)
         XCTAssertEqual(data[1], WireV2.version)
 
         var offset = 2
@@ -162,7 +162,7 @@ final class StreamingServerProtocolTests: XCTestCase {
     }
 
     func testV2NonKeyframeIsDroppedUntilFirstKeyframe() {
-        send([12, 8])
+        send([14, 8])
         _ = waitForBytes(24)
 
         server.sendFrame(makeFrame(keyframe: false)) // must be dropped

@@ -72,6 +72,12 @@ class MainActivity : AppCompatActivity() {
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
+
+    // Logical desktop behind the stream, 0 when the Mac predates desktopGeometry.
+    // Shown next to the stream size; never used to size the decoder.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
+
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
@@ -1027,6 +1033,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Stream size first, since that is what the decoder and every other stat in this overlay
+     * describe. The desktop size is appended only when it differs, so a scaled HiDPI desktop is
+     * visible rather than silently standing in for the resolution actually being sent.
+     */
+    private fun updateResolutionOverlay() {
+        if (displayWidth <= 0 || displayHeight <= 0) return
+        val stream = "${displayWidth}x$displayHeight"
+        val differs = desktopWidth > 0 && (desktopWidth != displayWidth || desktopHeight != displayHeight)
+        binding.resolutionText.text =
+            if (differs) "$stream (desktop ${desktopWidth}x$desktopHeight)" else stream
+    }
+
     private fun shouldUseTextureView(): Boolean = displayFlipHorizontal || displayFlipVertical
 
     private fun activeVideoSurface(): Pair<Surface, Boolean>? {
@@ -1095,7 +1114,18 @@ class MainActivity : AppCompatActivity() {
                 // Black screen with live stats: tell the user why instead of
                 // staying silent (issue #41). Toast renders above the (black)
                 // SurfaceView; the settings panel is hidden while streaming.
-                val cap = CodecCapabilities.maxDecodeSize(mime)
+                // The sustainable size, not the decoder's advertised one — that is typically far
+                // above anything it can really output, which made this message actively misleading.
+                val panel = PanelGeometry.of(displayObj)
+                val cap =
+                    panel?.let {
+                        CodecCapabilities.maxStreamSize(
+                            mime,
+                            it.width,
+                            it.height,
+                            CodecCapabilities.REFERENCE_FPS,
+                        )
+                    }
                 runOnUiThread {
                     val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
                     android.widget.Toast
@@ -1209,6 +1239,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        streamClient?.onDesktopSize = { w, h ->
+            desktopWidth = w
+            desktopHeight = h
+            runOnUiThread { updateResolutionOverlay() }
+        }
+
         streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
         streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
@@ -1220,7 +1256,7 @@ class MainActivity : AppCompatActivity() {
             displayFlipHorizontal = flipHorizontal
             displayFlipVertical = flipVertical
             runOnUiThread {
-                binding.resolutionText.text = "${width}x$height"
+                updateResolutionOverlay()
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
             }
@@ -1389,7 +1425,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 log("Connecting to $host:$port...")
 
-                streamClient = StreamClient(host, port)
+                streamClient = StreamClient(host, port, applicationContext)
                 streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
                     val dec = videoDecoder
                     if (dec != null) {
@@ -1477,6 +1513,12 @@ class MainActivity : AppCompatActivity() {
 
                 streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
+                streamClient?.onDesktopSize = { w, h ->
+                    desktopWidth = w
+                    desktopHeight = h
+                    runOnUiThread { updateResolutionOverlay() }
+                }
+
                 streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
                     mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
                     warnIfAvcOnlyWithoutNegotiation()
@@ -1487,7 +1529,7 @@ class MainActivity : AppCompatActivity() {
                     displayFlipVertical = flipVertical
 
                     runOnUiThread {
-                        binding.resolutionText.text = "${width}x$height"
+                        updateResolutionOverlay()
                         applyRotation(rotation, flipHorizontal, flipVertical)
                         initializeDecoderForCurrentSurface()
                     }
@@ -1562,6 +1604,8 @@ class MainActivity : AppCompatActivity() {
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
+        desktopWidth = 0
+        desktopHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {

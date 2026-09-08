@@ -80,37 +80,106 @@ final class TCPChannelSource: ChannelSource {
         self.queue = queue
     }
 
+    /// Port the listener actually bound (differs from `port` when 0 was
+    /// requested).
+    var boundPort: UInt16? {
+        listener?.port?.rawValue
+    }
+
+    /// Fire-and-forget start (ChannelSource conformance). Prefer the async
+    /// overload, which surfaces startup failures instead of only logging them.
     func start() {
         do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
-
-            // Optimize TCP for low-latency streaming
-            if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
-                tcpOptions.noDelay = true  // Disable Nagle's algorithm
-            }
-
-            listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
-
-            listener?.newConnectionHandler = { [weak self] newConnection in
-                self?.handleConnection(newConnection)
-            }
-
-            listener?.stateUpdateHandler = { [port] state in
-                switch state {
-                case .ready:
-                    debugLog("TCP Server listening on port \(port)")
-                case .failed(let error):
-                    debugLog("Server failed: \(error)")
-                default:
-                    break
-                }
-            }
-
-            listener?.start(queue: queue)
+            try makeListener(gate: nil)
         } catch {
             debugLog("Failed to start server: \(error)")
         }
+    }
+
+    /// Returns once the listener is actually ready; throws on bind failure,
+    /// cancellation, or timeout.
+    func start(startupTimeout: TimeInterval) async throws {
+        let startupGate = ListenerStartupGate()
+        let newListener: NWListener
+        do {
+            newListener = try makeListener(gate: startupGate)
+        } catch {
+            debugLog("Failed to start server: \(error)")
+            throw error
+        }
+
+        let startupPort = port
+        let timeoutWorkItem = DispatchWorkItem { [startupGate] in
+            startupGate.resolveTimeout(port: startupPort)
+        }
+        queue.asyncAfter(deadline: .now() + max(0, startupTimeout), execute: timeoutWorkItem)
+
+        defer { timeoutWorkItem.cancel() }
+        do {
+            try await startupGate.wait()
+            try Task.checkCancellation()
+        } catch {
+            newListener.cancel()
+            if listener === newListener {
+                listener = nil
+            }
+            debugLog("Failed to start server: \(error)")
+            throw error
+        }
+    }
+
+    @discardableResult
+    private func makeListener(gate: ListenerStartupGate?) throws -> NWListener {
+        let params = NWParameters.tcp
+        params.allowLocalEndpointReuse = true
+
+        // Optimize TCP for low-latency streaming
+        if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
+            tcpOptions.noDelay = true  // Disable Nagle's algorithm
+        }
+
+        let newListener: NWListener
+        do {
+            newListener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
+        } catch {
+            throw StreamingServerStartError.listenerFailed(port: port, underlying: error)
+        }
+
+        listener = newListener
+        newListener.newConnectionHandler = { [weak self] newConnection in
+            self?.handleConnection(newConnection)
+        }
+
+        newListener.stateUpdateHandler = { [port, gate] state in
+            switch state {
+            case .ready:
+                debugLog("TCP Server listening on port \(port)")
+                gate?.resolve(.success(()))
+            case .waiting(let error):
+                debugLog("Server waiting to listen: \(error)")
+                if case .posix(.EADDRINUSE) = error {
+                    gate?.resolve(
+                        .failure(StreamingServerStartError.listenerFailed(port: port, underlying: error))
+                    )
+                } else {
+                    gate?.noteWaitingError(error)
+                }
+            case .failed(let error):
+                debugLog("Server failed: \(error)")
+                gate?.resolve(
+                    .failure(StreamingServerStartError.listenerFailed(port: port, underlying: error))
+                )
+            case .cancelled:
+                gate?.resolve(
+                    .failure(StreamingServerStartError.cancelledBeforeReady(port: port))
+                )
+            default:
+                break
+            }
+        }
+
+        newListener.start(queue: queue)
+        return newListener
     }
 
     func stop() {

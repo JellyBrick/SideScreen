@@ -6,16 +6,18 @@ import java.nio.ByteOrder
 /**
  * Protocol v2 codec — mirror of MacHost/Sources/WireProtocolV2.swift.
  *
- * Negotiation: the client sends v1 type 12 (payload-free) before type 8; a v2
- * host answers v1 type 13 + [version], after which both directions speak the
+ * Negotiation: the client sends v1 type 14 (payload-free) before type 8; a v2
+ * host answers v1 type 15 + [version], after which both directions speak the
  * [type u8][len u24 BE] envelope exclusively. Legacy pairings are unaffected.
+ * (v1 types 12/13 belong to the upstream desktop-geometry exchange and must
+ * never be reused here.)
  *
  * All multi-byte integers are big endian except the touch payload, which
  * keeps v1's little-endian layout verbatim.
  */
 object WireV2 {
-    const val NEGOTIATION_REQUEST = 12
-    const val NEGOTIATION_ACCEPT = 13
+    const val NEGOTIATION_REQUEST = 14
+    const val NEGOTIATION_ACCEPT = 15
     const val VERSION = 2
 
     const val ENVELOPE_SIZE = 4
@@ -30,6 +32,7 @@ object WireV2 {
     const val MSG_VIDEO_CONFIG = 9
     const val MSG_CLIENT_STATS = 10
     const val MSG_NOP = 11
+    const val MSG_DESKTOP_GEOMETRY = 12
 
     const val FRAME_FLAG_KEYFRAME = 1
     const val FRAME_FLAG_LENGTH_PREFIXED = 2

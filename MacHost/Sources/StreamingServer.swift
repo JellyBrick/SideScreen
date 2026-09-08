@@ -23,15 +23,118 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, payload-free: "I understand desktopGeometry, and I read
+    /// displayConfig as the encoded stream size."
+    static let clientSupportsDesktopGeometry: UInt8 = 12
+    /// Server→client, 8-byte payload: the logical desktop size, for display
+    /// only. Sent ONLY to clients that sent clientSupportsDesktopGeometry —
+    /// older clients disconnect on unknown message types.
+    static let desktopGeometry: UInt8 = 13
 }
 
 /// Deterministic v2 switch-over (see WireProtocolV2.swift):
-/// - Client advertises v1 types in the order 9, 11, 12, 8 and then goes
-///   SILENT until it receives either v1 type 13 (→ v2) or any other v1
+/// - Client advertises v1 types in the order 9, 11, 12, 14, 8 and then goes
+///   SILENT until it receives either v1 type 15 (→ v2) or any other v1
 ///   message (→ legacy host, stay v1).
-/// - Host: on type 12 it immediately answers 13+version (its only pre-startup
+/// - Host: on type 14 it immediately answers 15+version (its only pre-startup
 ///   byte), and switches its INPUT parser to v2 right after processing the
 ///   type 8 that follows. Output switches at protocol startup.
+
+enum StreamingServerStartError: LocalizedError {
+    case listenerFailed(port: UInt16, underlying: Error)
+    case cancelledBeforeReady(port: UInt16)
+    case startupTimedOut(port: UInt16, lastWaitingError: Error?)
+
+    var errorDescription: String? {
+        switch self {
+        case .listenerFailed(let port, let underlying):
+            return "Could not listen on port \(port): \(underlying.localizedDescription)"
+        case .cancelledBeforeReady(let port):
+            return "Server startup on port \(port) was cancelled before the listener became ready."
+        case .startupTimedOut(let port, let lastWaitingError):
+            let detail = lastWaitingError.map { " Last listener error: \($0.localizedDescription)" } ?? ""
+            return "Timed out while waiting for the server to listen on port \(port).\(detail)"
+        }
+    }
+}
+
+/// Bridges NWListener's state callback to async startup without risking a
+/// leaked or double-resumed continuation. The listener may publish a state
+/// before `wait()` installs its continuation, so the first result is cached.
+final class ListenerStartupGate: @unchecked Sendable {
+    private enum State {
+        case pending
+        case waiting(CheckedContinuation<Void, Error>)
+        case completed(Result<Void, Error>)
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
+    private var lastWaitingError: Error?
+
+    func wait() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let completedResult: Result<Void, Error>?
+                lock.lock()
+                switch state {
+                case .pending:
+                    state = .waiting(continuation)
+                    completedResult = nil
+                case .completed(let result):
+                    completedResult = result
+                case .waiting:
+                    // A StreamingServer has exactly one startup waiter.
+                    completedResult = .failure(
+                        NSError(
+                            domain: "StreamingServer",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Server startup was awaited more than once."]
+                        )
+                    )
+                }
+                lock.unlock()
+
+                if let completedResult {
+                    continuation.resume(with: completedResult)
+                }
+            }
+        } onCancel: {
+            resolve(.failure(CancellationError()))
+        }
+    }
+
+    func noteWaitingError(_ error: Error) {
+        lock.lock()
+        lastWaitingError = error
+        lock.unlock()
+    }
+
+    func resolveTimeout(port: UInt16) {
+        lock.lock()
+        let waitingError = lastWaitingError
+        lock.unlock()
+        resolve(.failure(StreamingServerStartError.startupTimedOut(port: port, lastWaitingError: waitingError)))
+    }
+
+    func resolve(_ result: Result<Void, Error>) {
+        let continuation: CheckedContinuation<Void, Error>?
+        lock.lock()
+        switch state {
+        case .pending:
+            state = .completed(result)
+            continuation = nil
+        case .waiting(let waiter):
+            state = .completed(result)
+            continuation = waiter
+        case .completed:
+            continuation = nil
+        }
+        lock.unlock()
+
+        continuation?.resume(with: result)
+    }
+}
 
 /// Speaks the streaming protocol over any established ByteChannel. Transport
 /// mechanics (TCP listener, loopback trust, SSWA auth, SSPC pairing — and
@@ -112,6 +215,11 @@ class StreamingServer {
     private var clientIsAvcOnly = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
+    /// Set when the client opts in via type 12. Gates desktopGeometry sends.
+    private var clientSupportsDesktopGeometry = false
+    /// Logical desktop size, reported alongside the encoded size for display.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
     // Input parse buffer with a consume cursor: advancing `inputStart`
     // replaces the old remove-from-front pattern (which shifted the whole
     // remainder on every message); the storage compacts periodically.
@@ -319,9 +427,17 @@ class StreamingServer {
 
     private var aoaSource: AOAChannelSource?
 
-    func start() {
+    /// Port the TCP listener actually bound (differs from `port` when 0 was
+    /// requested).
+    var boundPort: UInt16? {
+        tcpSource.boundPort
+    }
+
+    /// Returns once the TCP listener is actually ready; throws on failure or
+    /// timeout instead of logging and pretending the server is up.
+    func start(startupTimeout: TimeInterval = 10) async throws {
         isStopped = false
-        tcpSource.start()
+        try await tcpSource.start(startupTimeout: startupTimeout)
         aoaSource?.start()
     }
 
@@ -337,6 +453,7 @@ class StreamingServer {
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
+        clientSupportsDesktopGeometry = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         inputStart = 0
@@ -412,6 +529,13 @@ class StreamingServer {
         onClientConnected?()
     }
 
+    /// The logical desktop the user picked. Purely informational: the client
+    /// must size its decoder from displayConfig, never from this.
+    func setDesktopSize(width: Int, height: Int) {
+        desktopWidth = width
+        desktopHeight = height
+    }
+
     func setDisplaySize(width: Int, height: Int, rotation: Int = 0, flipHorizontal: Bool = false, flipVertical: Bool = false) {
         displayWidth = width
         displayHeight = height
@@ -442,6 +566,27 @@ class StreamingServer {
             channel.send(data, completion: nil)
         }
         debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+        sendDesktopGeometry()
+    }
+
+    /// Follows every display config so the two can never disagree on screen.
+    private func sendDesktopGeometry() {
+        guard let channel = channel else { return }
+        guard desktopWidth > 0, desktopHeight > 0 else { return }
+
+        if v2Active {
+            // v2 envelopes are length-prefixed, so no opt-in is needed —
+            // clients that predate the message skip it by length.
+            enqueueControl(WireV2.encodeDesktopGeometry(width: desktopWidth, height: desktopHeight))
+        } else {
+            guard clientSupportsDesktopGeometry else { return }
+            var data = Data()
+            data.append(WireMessage.desktopGeometry)
+            data.append(contentsOf: withUnsafeBytes(of: Int32(desktopWidth).bigEndian) { Data($0) })
+            data.append(contentsOf: withUnsafeBytes(of: Int32(desktopHeight).bigEndian) { Data($0) })
+            channel.send(data, completion: nil)
+        }
+        debugLog("Sent desktop geometry: \(desktopWidth)x\(desktopHeight)")
     }
 
     private func startReceivingTouch() {
@@ -603,6 +748,31 @@ class StreamingServer {
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
                     debugLog("Client decoder limit: \(w)x\(h)")
+                    // Arrived after the 100 ms legacy grace already finished
+                    // startup (slow link, slow device): re-negotiate now so the
+                    // limit still takes effect instead of waiting for the next
+                    // restart. The handler re-sends the display config itself
+                    // when the encode size changes.
+                    if connectionReady {
+                        debugLog("Decoder limit arrived late — re-negotiating")
+                        let before = (displayWidth, displayHeight)
+                        onCodecNegotiated?(clientIsAvcOnly ? .h264 : .hevc)
+                        if (displayWidth, displayHeight) != before {
+                            sendDisplaySize()
+                        }
+                    }
+                }
+
+            case WireMessage.clientSupportsDesktopGeometry:
+                // Payload-free opt-in (same convention as types 8 and 9), sent
+                // BEFORE type 8 so it lands before finishProtocolStartup runs.
+                consumeInputBytes(1)
+                if !clientSupportsDesktopGeometry {
+                    clientSupportsDesktopGeometry = true
+                    debugLog("Client reads displayConfig as the encoded size")
+                    // Late opt-in (after startup): the display config already
+                    // went out without geometry, so send it on its own.
+                    if connectionReady { sendDesktopGeometry() }
                 }
 
             default:

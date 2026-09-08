@@ -202,14 +202,11 @@ class ScreenCapture {
     /// Codec for the current encode session. Switching restarts the stream.
     private(set) var codec: StreamCodec = .hevc
 
-    /// Decoder ceiling reported by the connected client (issue #41). Nil for
-    /// legacy clients that report nothing.
+    /// Largest frame the connected client wants to receive (issue #41): the
+    /// smaller of its panel size and what its decoder can sustain at the panel
+    /// refresh rate. Nil for legacy clients that report nothing.
     private var clientDecodeLimit: (width: Int, height: Int)?
 
-    /// Encode dimensions for a codec: physical display pixels, clamped to the
-    /// client's reported decoder limit when known, else to the conservative
-    /// AVC floor when streaming H.264. SCStream/CGDisplayStream scale the
-    /// capture into this size, so no virtual-display change is needed.
     /// Pixel-RATE budget for the encode size: a single Apple media engine
     /// (and the tablet-class HEVC decoder) sustains roughly ~660Mpixel/s, so
     /// the per-frame pixel cap follows the TARGET FPS instead of being a
@@ -225,6 +222,14 @@ class ScreenCapture {
     /// default: resolution is never touched unless the user asks for it.
     var throughputCapEnabled = false
 
+    /// Encode dimensions for a codec: physical display pixels, clamped to the
+    /// client's reported ceiling when known, else to the conservative AVC floor
+    /// when streaming H.264. SCStream/CGDisplayStream scale the capture into
+    /// this size, so no virtual-display change is needed.
+    ///
+    /// This is what makes HiDPI usable on a tablet: macOS renders at 2x, SCStream
+    /// downsamples to the client's ceiling before encode, and the client decodes
+    /// a frame it can sustain — sharper than a 1x capture of the same size.
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
         var phys = (displayWidth, displayHeight)
         let pixels = phys.0 * phys.1
@@ -239,8 +244,8 @@ class ScreenCapture {
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
         if let limit = clientDecodeLimit {
-            return CodecLimits.clamp(width: phys.0, height: phys.1,
-                                     maxWidth: limit.width, maxHeight: limit.height)
+            let budget = CodecLimits.scaleLimit(limit, forFps: refreshRate)
+            return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: budget)
         }
         switch codec {
         case .hevc: return phys
@@ -433,7 +438,14 @@ class ScreenCapture {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // Video-range (16-235) rather than full-range (0-255). VideoToolbox
+        // derives the bitstream's VUI full_range_flag from the pixel format,
+        // and several Android vendor display paths (Xiaomi/HyperOS among
+        // them) apply a limited-range YUV->RGB matrix regardless of that
+        // flag, which clips full-range highlights to white and crushes
+        // shadows (#55). Limited range is what every decoder/GPU assumes by
+        // default, so it renders identically everywhere.
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = true
         config.queueDepth = 4
         config.capturesAudio = false
@@ -741,7 +753,8 @@ class ScreenCapture {
 
         debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
 
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        // Video-range to match the SCStream path (see #55 note above).
+        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
 
         // Without kCGDisplayStreamShowCursor the fallback stream never

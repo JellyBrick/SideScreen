@@ -24,7 +24,7 @@ import java.util.concurrent.TimeUnit
 class StreamClient(
     private val host: String,
     private val port: Int,
-    private val context: Context? = null,
+    private val context: Context,
 ) {
     private var socket: Socket? = null
     private var transport: StreamTransport? = null
@@ -37,6 +37,9 @@ class StreamClient(
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
+
+    /** Logical desktop size behind the stream. Display only; never size the decoder from it. */
+    var onDesktopSize: ((Int, Int) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
 
     /** Invoked when the server confirms the stream codec (true = HEVC). */
@@ -50,12 +53,12 @@ class StreamClient(
     @Volatile var codecNegotiated = false
         private set
 
-    /** True once the host accepted protocol v2 (type 13). */
+    /** True once the host accepted protocol v2 (type 15). */
     @Volatile var v2Active = false
         private set
 
     /**
-     * False between our type-12 advert and the host's first reply. Outbound
+     * False between our type-14 advert and the host's first reply. Outbound
      * traffic (ping/touch/keyframe requests) is gated on this: a v2 host
      * switches its input parser right after our type 8, so any v1-format
      * bytes sent in that window would corrupt its stream.
@@ -313,14 +316,12 @@ class StreamClient(
             // Before connect — see the USB path for why. Wireless gets a
             // bigger window: Wi-Fi BDP with retransmits far exceeds loopback.
             sock.receiveBufferSize = WIRELESS_SOCKET_RECEIVE_BUFFER
+            val cm = context.getSystemService(ConnectivityManager::class.java)
             val wifiNetwork =
-                context?.let { ctx ->
-                    val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                    cm.allNetworks.firstOrNull { net ->
-                        val caps = cm.getNetworkCapabilities(net)
-                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    }
+                cm.allNetworks.firstOrNull { net ->
+                    val caps = cm.getNetworkCapabilities(net)
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 }
             if (wifiNetwork != null) {
                 Log.i(TAG, "openWirelessSocket: binding socket to WiFi network $wifiNetwork")
@@ -529,6 +530,7 @@ class StreamClient(
         synchronized(wireAgesMs) { wireAgesMs.clear() }
         advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
         advertiseDecoderLimits() // Also before type 8, for the same reason
+        advertiseDesktopGeometrySupport() // Likewise
         advertiseV2Support() // Before type 8 too: the host flips to v2 input right after type 8
         advertiseFrameMetadataSupport()
         isConnected = true
@@ -620,6 +622,14 @@ class StreamClient(
         }
     }
 
+    private fun advertiseDesktopGeometrySupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY)
+            out.flush()
+            diagLog("Advertised desktop-geometry support")
+        }
+    }
+
     private fun advertiseFrameMetadataSupport() {
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
@@ -646,7 +656,15 @@ class StreamClient(
     }
 
     private fun advertiseDecoderLimits() {
-        val (maxW, maxH) = CodecCapabilities.maxDecodeSize(CodecCapabilities.streamMime) ?: return
+        val mime = CodecCapabilities.streamMime
+        val panel = PanelGeometry.ofDefaultDisplay(context)
+        // Nominal limit only as a fallback: it ignores blocks-per-second, so on most devices it is
+        // far too high to protect anything.
+        val limit =
+            panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.REFERENCE_FPS) }
+                ?: CodecCapabilities.nominalMaxDecodeSize(mime)
+                ?: return
+        val (maxW, maxH) = limit
         val w = maxW.coerceAtMost(16383)
         val h = maxH.coerceAtMost(16383)
         if (w < 256 || h < 256) return
@@ -660,7 +678,7 @@ class StreamClient(
             out.writeByte(0x80 or ((h shr 7) and 0x7F))
             out.writeByte(0x80 or (h and 0x7F))
             out.flush()
-            diagLog("Advertised decoder limit ${w}x$h for ${CodecCapabilities.streamMime}")
+            diagLog("Advertised stream limit ${w}x$h for $mime (panel=$panel)")
         }
     }
 
@@ -712,6 +730,16 @@ class StreamClient(
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        MESSAGE_DESKTOP_GEOMETRY -> {
+                            // A v1 host message: the host would have answered a
+                            // v2 request with NEGOTIATION_ACCEPT before this.
+                            protocolDecided = true
+                            val dw = input.readInt()
+                            val dh = input.readInt()
+                            diagLog("Desktop geometry: ${dw}x$dh")
+                            onDesktopSize?.invoke(dw, dh)
                         }
 
                         MESSAGE_CODEC_SELECTED -> {
@@ -1086,6 +1114,20 @@ class StreamClient(
                     onDisplaySize?.invoke(width, height, rotation, flags and 1 == 1, flags and 2 == 2)
                 }
 
+                WireV2.MSG_DESKTOP_GEOMETRY -> {
+                    if (len < 8) {
+                        skipFully(input, len)
+                        continue
+                    }
+                    input.readFully(scratch, 0, 8)
+                    if (len > 8) skipFully(input, len - 8)
+                    val buf = ByteBuffer.wrap(scratch, 0, 8)
+                    val dw = buf.int
+                    val dh = buf.int
+                    diagLog("v2 desktop geometry: ${dw}x$dh")
+                    onDesktopSize?.invoke(dw, dh)
+                }
+
                 WireV2.MSG_VIDEO_CONFIG -> {
                     if (len < 2 || len > 65536) {
                         skipFully(input, len)
@@ -1264,6 +1306,8 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
+        private const val MESSAGE_DESKTOP_GEOMETRY = 13
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

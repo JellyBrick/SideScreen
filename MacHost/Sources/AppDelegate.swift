@@ -152,6 +152,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
 
+        // "Displays have separate Spaces" off → any fullscreen app blanks the
+        // virtual display (#50). Nothing we can do about it from capture side;
+        // surface it so the user knows why the tablet went black.
+        let separateSpaces = NSScreen.screensHaveSeparateSpaces
+        if separateSpaces != settings.displaysHaveSeparateSpaces {
+            settings.displaysHaveSeparateSpaces = separateSpaces
+            if !separateSpaces {
+                debugLog("WARNING: 'Displays have separate Spaces' is OFF — fullscreen apps on the Mac will blank the tablet (#50)")
+            }
+        }
+
         // While a wireless client is actively streaming, keep its lastConnected
         // rolling forward so the UI shows "just now". On disconnect, the
         // onClientDisconnected handler clears currentWirelessDevice — from that
@@ -639,7 +650,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Setup capture
-            guard let displayID = virtualDisplayManager?.displayID else { return }
+            guard let displayID = virtualDisplayManager?.displayID else {
+                throw NSError(
+                    domain: "SideScreen.Startup",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "The virtual display was created without a display ID."]
+                )
+            }
             screenCapture = try await ScreenCapture()
             screenCapture?.throughputCapEnabled = settings.encodeThroughputCap
             screenCapture?.onCaptureMethodChanged = { [weak self] method in
@@ -670,13 +687,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-            // Send the LOGICAL resolution that the user picked. The H.264 SPS in
-            // the stream still carries the true physical pixel dimensions, so the
-            // Android decoder/MediaCodec sets up correctly regardless. Sending the
-            // logical dimensions here makes the resolution overlay on Android
-            // match the Mac's resolution dropdown (e.g. "2560x1600" instead of
-            // the HiDPI-doubled "5120x3200").
-            streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
+            // displayConfig carries the ENCODED size, always. The client sizes and
+            // selects its decoder from it, so a friendlier number here makes it
+            // check capabilities against a resolution it will never receive. The
+            // logical desktop travels separately, for display only.
+            let initialEncode = ScreenCapture.physicalSize(for: displayID)
+            streamingServer?.setDesktopSize(width: size.width, height: size.height)
+            streamingServer?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
@@ -711,13 +728,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self, let capture = self.screenCapture else { return }
                 capture.negotiate(codec: codec, clientLimit: self.streamingServer?.clientDecodeLimits)
                 let enc = capture.encodeSize(for: codec)
-                // Unclamped HEVC keeps the logical user-picked resolution,
-                // exactly as at startup; any clamped size (client decoder
-                // limit, or the AVC floor) must match what the stream's SPS
-                // will carry so the client sizes its decoder correctly.
-                let unclampedHevc = codec == .hevc && enc == (capture.displayWidth, capture.displayHeight)
-                let (w, h) = unclampedHevc ? (size.width, size.height) : (enc.width, enc.height)
-                self.streamingServer?.setDisplaySize(width: w, height: h, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+                // Whatever the codec negotiation settled on, this is what the
+                // stream's SPS will carry, so it is what the client must size
+                // its decoder for.
+                self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
+                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
             }
             streamingServer?.onKeyframeRequested = { [weak self] force in
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
@@ -750,9 +765,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.start()
+            guard let server = streamingServer else {
+                throw NSError(
+                    domain: "SideScreen.Startup",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "The streaming server could not be created."]
+                )
+            }
+            try await server.start()
             screenCapture?.startStreaming(
-                to: streamingServer,
+                to: server,
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
                 gamingBoost: settings.gamingBoost,
@@ -767,8 +789,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             print("❌ Failed to start: \(error)")
             await MainActor.run {
-                settings.isRunning = false
-                settings.displayCreated = false
+                self.tearDownServerResources(saveDisplayPosition: false)
 
                 let alert = NSAlert()
                 alert.messageText = "Failed to Start Server"
@@ -811,9 +832,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func stopServer() {
-        // Save display position before destroying
-        virtualDisplayManager?.saveDisplayPosition()
+    private func tearDownServerResources(saveDisplayPosition: Bool) {
+        if saveDisplayPosition {
+            virtualDisplayManager?.saveDisplayPosition()
+        }
         settings.pairingCode = nil
         streamingServer?.expectedPairingCode = nil
 
@@ -821,11 +843,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamingServer?.stop()
         virtualDisplayManager?.destroyDisplay()
 
+        screenCapture = nil
+        streamingServer = nil
+        virtualDisplayManager = nil
+        currentWirelessDevice = nil
+
         settings.isRunning = false
         settings.displayCreated = false
         settings.clientConnected = false
+        settings.currentWirelessDevice = nil
         settings.currentFPS = 0
         settings.currentBitrate = 0
+    }
+
+    func stopServer() {
+        tearDownServerResources(saveDisplayPosition: true)
 
         print("⏹️ Server stopped")
     }

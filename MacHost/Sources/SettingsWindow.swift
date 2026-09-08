@@ -863,6 +863,34 @@ struct SettingsView: View {
                                     .cornerRadius(8)
                                 }
 
+                                if !settings.displaysHaveSeparateSpaces {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "exclamationmark.triangle.fill")
+                                                .foregroundColor(.orange)
+                                            Text("Tablet goes black in fullscreen apps")
+                                                .font(.system(size: 12, weight: .medium))
+                                        }
+                                        Text("\"Displays have separate Spaces\" is turned off, so macOS blanks every other display — including the tablet — whenever an app enters fullscreen. Turn it on in System Settings → Desktop & Dock → Mission Control, then log out and back in.")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        Button(action: {
+                                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Desktop-Settings.extension")!)
+                                        }) {
+                                            HStack {
+                                                Image(systemName: "gear")
+                                                Text("Open System Settings")
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                    }
+                                    .padding(10)
+                                    .background(Color.orange.opacity(0.1))
+                                    .cornerRadius(8)
+                                }
+
                                 if !settings.hasAccessibilityPermission {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack(spacing: 6) {
@@ -1278,6 +1306,12 @@ class DisplaySettings: ObservableObject {
     @Published var pairingCode: String?
     @Published var hasScreenRecordingPermission = false
     @Published var hasAccessibilityPermission = false
+    /// Mirrors `NSScreen.screensHaveSeparateSpaces`. When the user has turned
+    /// off "Displays have separate Spaces", macOS blanks every other display
+    /// (including our virtual one) whenever any app goes fullscreen — the
+    /// tablet shows black while the stream keeps flowing (issue #50). The
+    /// setting only takes effect after logout, so this is a per-session fact.
+    @Published var displaysHaveSeparateSpaces = true
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
     @Published var usbDeviceConnected = false
@@ -1331,7 +1365,7 @@ class DisplaySettings: ObservableObject {
 
     static let resolutionGroups: [ResolutionGroup] = [
         ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
-            "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600"
+            "1280x800", "1440x900", "1680x1050", "1920x1200", "2304x1440", "2560x1600"
         ]),
         ResolutionGroup(name: "16:9", ratio: "HD/4K", resolutions: [
             "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160"
