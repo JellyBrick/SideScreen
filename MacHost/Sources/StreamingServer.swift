@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import Network
 import os
@@ -24,26 +25,22 @@ private enum WireMessage {
     static let clientDecoderLimits: UInt8 = 11
 }
 
-private extension NWEndpoint {
-    var isLoopback: Bool {
-        switch self {
-        case .hostPort(let host, _):
-            switch host {
-            case .ipv4(let v4): return v4.isLoopback
-            case .ipv6(let v6): return v6.isLoopback
-            case .name(let name, _): return name == "localhost"
-            @unknown default: return false
-            }
-        default:
-            return false
-        }
-    }
-}
+/// Deterministic v2 switch-over (see WireProtocolV2.swift):
+/// - Client advertises v1 types in the order 9, 11, 12, 8 and then goes
+///   SILENT until it receives either v1 type 13 (→ v2) or any other v1
+///   message (→ legacy host, stay v1).
+/// - Host: on type 12 it immediately answers 13+version (its only pre-startup
+///   byte), and switches its INPUT parser to v2 right after processing the
+///   type 8 that follows. Output switches at protocol startup.
 
+/// Speaks the streaming protocol over any established ByteChannel. Transport
+/// mechanics (TCP listener, loopback trust, SSWA auth, SSPC pairing — and
+/// later the AOA bulk pipe) live in ChannelSource implementations; this class
+/// owns protocol startup, framing, touch input, and stats.
 class StreamingServer {
     private let port: UInt16
-    private var listener: NWListener?
-    private var connection: NWConnection?
+    private let tcpSource: TCPChannelSource
+    private var channel: ByteChannel?
     var onClientConnected: (() -> Void)?
     var onClientDisconnected: (() -> Void)?
     /// Fired once per connection during protocol startup, BEFORE the display
@@ -54,53 +51,46 @@ class StreamingServer {
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
+    /// Transport of the active client: true = physically secured (USB — adb
+    /// reverse loopback today, AOA later), false = LAN (wireless), nil = no
+    /// client has completed protocol startup.
+    private(set) var activeClientIsLoopback: Bool?
     // Whether host wants to receive touch events from client. Ping/pong is
     // handled regardless. When false, incoming touch frames are dropped
     // immediately without parsing or dispatching to main queue.
     var touchEnabled: Bool = true
 
-    // Wireless auth: when non-nil, non-loopback connections must present this
-    // 32-byte token before being allowed to proceed. nil means wireless mode
-    // is inactive — non-loopback connections are rejected immediately.
-    var expectedAuthToken: Data?
-    var onWirelessClientPaired: ((String) -> Void)?
-
-    // Code pairing (issue #35): when non-nil, a pre-auth "SSPC" request
-    // carrying this one-time code is answered with the real auth token, and
-    // the client reconnects through the normal SSWA handshake. Only honored
-    // while wireless mode is active (expectedAuthToken != nil).
-    //
-    // The code is written from the main thread (rotation) and read on
-    // networkQueue (validation), so state lives behind a lock — and
-    // validate-and-consume is a single critical section, so a code can never
-    // be redeemed twice and pipelined guesses can never exceed the attempt
-    // budget before the invalidation lands.
-    private struct PairingState {
-        var code: String?
-        var failedAttempts = 0
+    // Wireless auth + code pairing are transport (TCP) concerns; these
+    // forward to the TCP source so existing callers stay unchanged.
+    var expectedAuthToken: Data? {
+        get { tcpSource.expectedAuthToken }
+        set { tcpSource.expectedAuthToken = newValue }
     }
 
-    private let pairingStateLock = OSAllocatedUnfairLock(initialState: PairingState())
-    private static let maxPairingAttempts = 5
+    var onWirelessClientPaired: ((String) -> Void)? {
+        get { tcpSource.onWirelessClientPaired }
+        set { tcpSource.onWirelessClientPaired = newValue }
+    }
 
     var expectedPairingCode: String? {
-        get { pairingStateLock.withLock { $0.code } }
-        set {
-            pairingStateLock.withLock { state in
-                state.code = newValue
-                state.failedAttempts = 0
-            }
-        }
+        get { tcpSource.expectedPairingCode }
+        set { tcpSource.expectedPairingCode = newValue }
     }
 
-    var pairingMacName: String = "Mac"
-    /// Fired with the device name after a code was accepted and the token
-    /// issued. The code is already consumed (nil); the owner should install a
-    /// fresh one.
-    var onPairingSuccess: ((String) -> Void)?
-    /// Fired when the attempt budget is exhausted. The code is already
-    /// invalidated (nil); the owner should install a fresh one.
-    var onPairingCodeExhausted: (() -> Void)?
+    var pairingMacName: String {
+        get { tcpSource.pairingMacName }
+        set { tcpSource.pairingMacName = newValue }
+    }
+
+    var onPairingSuccess: ((String) -> Void)? {
+        get { tcpSource.onPairingSuccess }
+        set { tcpSource.onPairingSuccess = newValue }
+    }
+
+    var onPairingCodeExhausted: (() -> Void)? {
+        get { tcpSource.onPairingCodeExhausted }
+        set { tcpSource.onPairingCodeExhausted = newValue }
+    }
 
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
@@ -122,120 +112,292 @@ class StreamingServer {
     private var clientIsAvcOnly = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
+    // Input parse buffer with a consume cursor: advancing `inputStart`
+    // replaces the old remove-from-front pattern (which shifted the whole
+    // remainder on every message); the storage compacts periodically.
     private var inputBuffer = Data()
+    private var inputStart = 0
+
+    private var inputAvailable: Int { inputBuffer.count - inputStart }
+
+    private func inputData(at offset: Int, count: Int) -> Data {
+        let base = inputStart + offset
+        return inputBuffer.subdata(in: base..<(base + count))
+    }
+
+    // ---- protocol v2 state ----
+    /// Client sent type 12 (set on receiveQueue during startup).
+    private var clientRequestedV2 = false
+    /// Input parser mode: flips after the type-8 that follows a type-12.
+    private var v2InputActive = false
+    /// Output mode: v2 envelopes from protocol startup on. Written on
+    /// receiveQueue before connectionReady, read afterwards — the
+    /// connectionReady handshake orders it.
+    private var v2Active = false
+    private var negotiatedCodec: StreamCodec = .hevc
+    private var lastSentFormat: CMFormatDescription?
+
+    // v2 send scheduler — every field below is touched ONLY on frameQueue.
+    private var controlQueue: [Data] = []
+    private var pendingV2Frames: [EncodedFrame] = []
+    private var pendingV2Bytes = 0
+    private var currentFrame: EncodedFrame?
+    private var currentFrameId: UInt32 = 0
+    private var nextFrameId: UInt32 = 0
+    private var currentOffset = 0
+    private var inflightBytes = 0
+    private var needKeyframeResync = false
+    /// Exposed for capture-side admission. True while the in-flight byte
+    /// watermark is exceeded. Written on frameQueue, read from capture
+    /// threads — hence the lock.
+    private let congestedFlag = OSAllocatedUnfairLock(initialState: false)
+    var isCongested: Bool { congestedFlag.withLock { $0 } }
+    /// True when the active client negotiated protocol v2.
+    var clientUsesV2: Bool { v2Active }
+    private var chunkSize = WireV2.tcpChunkSize
+    /// In-flight byte ceiling before video dequeue pauses. Per-transport:
+    /// AOA gets a shallower queue (measured ~335 Mbps ceiling → 256KB ≈ 6ms)
+    /// so control preemption stays tight.
+    private var watermarkBytes = 512 * 1024
+    private static let tcpWatermarkBytes = 512 * 1024
+    private static let aoaWatermarkBytes = 256 * 1024
+    private static let maxQueuedV2Bytes = 8 * 1024 * 1024
+
+    // ---- adaptive bitrate (AIMD, v2 clients only) ----
+    // Signals: send-watermark congestion (primary) and forced keyframe
+    // requests (client-side pain). Decrease multiplicatively and hold;
+    // increase additively toward the user's ceiling. Applied through
+    // setLiveBitrate — no encoder session recreation.
+    var onBitrateSuggestion: ((Int) -> Void)?
+    private var abrTimer: DispatchSourceTimer?
+    private var abrCeilingMbps = 0
+    private var abrCurrentMbps = 0
+    private var abrHoldTicks = 0
+    private var abrStableTicks = 0
+    private var abrCongestedTicks = 0
+    private var abrForcedKeyframes = 0
+    private static let abrFloorMbps = 10
+    private static let aoaSafeCeilingMbps = 300
+
+    /// Start/refresh the controller for the active session. `ceilingMbps` is
+    /// the user's setting (already wireless-capped by the caller).
+    func configureAdaptiveBitrate(ceilingMbps: Int) {
+        frameQueue.async { [weak self] in
+            guard let self = self else { return }
+            var ceilingMbps = ceilingMbps
+            if self.channel?.kind == .aoa {
+                // Soak finding (Galaxy Tab): sustained saturation (~480 Mbps)
+                // progressively crashed the device's USB gadget stack — adb
+                // first, then the whole bus, recoverable only by replug.
+                // Stay well below the ~480 Mbps ceiling.
+                ceilingMbps = min(ceilingMbps, Self.aoaSafeCeilingMbps)
+            }
+            self.abrCeilingMbps = ceilingMbps
+            self.abrCurrentMbps = min(max(self.abrCurrentMbps, Self.abrFloorMbps), ceilingMbps)
+            if self.abrCurrentMbps == Self.abrFloorMbps { self.abrCurrentMbps = ceilingMbps }
+            // Apply the (possibly transport-capped) starting rate to the
+            // encoder NOW. Without this the encoder ran at the raw user
+            // setting (up to 5000 Mbps — 15x the AOA link) until the first
+            // congestion cut, guaranteeing a session-start congestion storm.
+            self.onBitrateSuggestion?(self.abrCurrentMbps)
+            self.abrCongestedTicks = 0
+            self.abrForcedKeyframes = 0
+            guard self.abrTimer == nil else { return }
+            let timer = DispatchSource.makeTimerSource(queue: self.frameQueue)
+            timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
+            timer.setEventHandler { [weak self] in
+                self?.abrTick()
+            }
+            timer.resume()
+            self.abrTimer = timer
+        }
+    }
+
+    func stopAdaptiveBitrate() {
+        frameQueue.async { [weak self] in
+            self?.abrTimer?.cancel()
+            self?.abrTimer = nil
+        }
+    }
+
+    /// frameQueue only. Congestion is sampled at tick time and must persist
+    /// for two consecutive ticks: a latched any-time-in-window flag turned
+    /// every keyframe transit (a ~1MB burst through a 256KB watermark) into a
+    /// bitrate cut, and the periodic self-heal IDRs then walked the rate down
+    /// to the floor.
+    private func abrTick() {
+        guard v2Active, connectionReady, abrCeilingMbps > 0 else { return }
+        if isCongested {
+            abrCongestedTicks += 1
+        } else {
+            abrCongestedTicks = 0
+        }
+        let congested = abrCongestedTicks >= 2
+        let pain = abrForcedKeyframes >= 2
+        abrForcedKeyframes = 0
+
+        if abrHoldTicks > 0 {
+            abrHoldTicks -= 1
+            return
+        }
+        if congested || pain {
+            let reduced = max(Self.abrFloorMbps, Int(Double(abrCurrentMbps) * 0.7))
+            if reduced != abrCurrentMbps {
+                abrCurrentMbps = reduced
+                abrStableTicks = 0
+                abrHoldTicks = 8 // 2s hold after a cut
+                debugLog("ABR: congestion — bitrate ↓ \(abrCurrentMbps) Mbps")
+                onBitrateSuggestion?(abrCurrentMbps)
+            }
+            return
+        }
+        abrStableTicks += 1
+        if abrStableTicks >= 4, abrCurrentMbps < abrCeilingMbps {
+            abrStableTicks = 0
+            let increased = min(abrCeilingMbps, max(abrCurrentMbps + 5, Int(Double(abrCurrentMbps) * 1.08)))
+            if increased != abrCurrentMbps {
+                abrCurrentMbps = increased
+                onBitrateSuggestion?(abrCurrentMbps)
+            }
+        }
+    }
 
     init(port: UInt16) {
         self.port = port
+        self.tcpSource = TCPChannelSource(port: port, queue: networkQueue)
+        wireSource(tcpSource)
     }
+
+    private func wireSource(_ source: ChannelSource) {
+        source.onIncomingConnection = { [weak self] incoming in
+            guard let self = self else { return }
+            // Protect an active USB-direct session from the client's TCP
+            // fallback probes and stray loopback connections.
+            if let current = self.channel, current.kind == .aoa, incoming.kind != .aoa {
+                debugLog("TCP client ignored — USB-direct session active")
+                incoming.cancel()
+                return
+            }
+            self.prepareForNewClient()
+        }
+        source.onChannelEstablished = { [weak self] channel in
+            self?.beginExistingProtocol(on: channel)
+        }
+        source.onChannelClosed = { [weak self] closed in
+            guard let self = self else { return }
+            // Only the active channel's death is a client disconnect;
+            // rejected/preempted connections die silently.
+            guard self.channel === closed else { return }
+            self.activeClientIsLoopback = nil
+            self.channel = nil
+            self.onClientDisconnected?()
+        }
+    }
+
+    /// Opt-in AOA bulk transport (USB direct). Safe to call before start().
+    func enableUSBDirect() {
+        guard aoaSource == nil else { return }
+        let source = AOAChannelSource(callbackQueue: networkQueue)
+        // Block the mode switch only for sessions the switch would truly
+        // break: wireless clients (possibly a different device). A loopback
+        // (adb TCP) session is the same plugged-in tablet — switching cuts it
+        // for a few seconds and it reconnects over AOA, which is the upgrade
+        // we want. Auto-reconnecting clients would otherwise never leave TCP.
+        source.isSessionActive = { [weak self] in
+            guard let self = self else { return false }
+            return self.connectionReady && self.activeClientIsLoopback != true
+        }
+        wireSource(source)
+        aoaSource = source
+        if !isStopped {
+            source.start()
+        }
+    }
+
+    /// e.g. "USB 10 Gbps" while an AOA link is up, nil otherwise.
+    var usbDirectLinkDescription: String? { aoaSource?.linkDescription }
+
+    private var aoaSource: AOAChannelSource?
 
     func start() {
         isStopped = false
-        do {
-            let params = NWParameters.tcp
-            params.allowLocalEndpointReuse = true
-
-            // Optimize TCP for low-latency streaming
-            if let tcpOptions = params.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
-                tcpOptions.noDelay = true  // Disable Nagle's algorithm
-            }
-
-            listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
-
-            listener?.newConnectionHandler = { [weak self] newConnection in
-                self?.handleConnection(newConnection)
-            }
-
-            listener?.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    debugLog("TCP Server listening on port \(self.port)")
-                case .failed(let error):
-                    debugLog("Server failed: \(error)")
-                default:
-                    break
-                }
-            }
-
-            listener?.start(queue: networkQueue)
-        } catch {
-            debugLog("Failed to start server: \(error)")
-        }
+        tcpSource.start()
+        aoaSource?.start()
     }
 
-    private func handleConnection(_ newConnection: NWConnection) {
-        debugLog("New connection incoming...")
-
-        // Clean up old connection properly
-        if let oldConnection = connection {
+    /// Single-client policy, exactly as before the transport refactor: any
+    /// incoming peer preempts the active session before it is even vetted.
+    private func prepareForNewClient() {
+        if let oldChannel = channel {
             isReceiving = false
-            oldConnection.cancel()
+            oldChannel.cancel()
         }
-
+        channel = nil
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
-        connection = newConnection
+        inputStart = 0
         droppedFrames = 0
-
-        connection?.stateUpdateHandler = { [weak self] state in
-            debugLog("Connection state: \(state)")
-            switch state {
-            case .ready:
-                self?.onConnectionReady(newConnection)
-            case .failed(let error):
-                debugLog("Connection failed: \(error)")
-                self?.onClientDisconnected?()
-            case .cancelled:
-                debugLog("Connection cancelled")
-                self?.onClientDisconnected?()
-            default:
-                break
-            }
+        clientRequestedV2 = false
+        v2InputActive = false
+        v2Active = false
+        lastSentFormat = nil
+        frameQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.controlQueue.removeAll()
+            self.pendingV2Frames.removeAll()
+            self.pendingV2Bytes = 0
+            self.currentFrame = nil
+            self.currentOffset = 0
+            self.inflightBytes = 0
+            self.congestedFlag.withLock { $0 = false }
+            self.needKeyframeResync = false
         }
-
-        connection?.start(queue: networkQueue)
     }
 
-    private func onConnectionReady(_ conn: NWConnection) {
-        if conn.endpoint.isLoopback {
-            debugLog("Client connected via loopback (USB) — skipping auth")
-            beginExistingProtocol(on: conn)
-            return
-        }
-        guard let expected = expectedAuthToken else {
-            debugLog("Rejecting non-loopback client: wireless mode not active")
-            conn.cancel()
-            return
-        }
-        debugLog("Client connected via LAN — running auth handshake")
-        runAuthHandshake(connection: conn, expectedToken: expected)
-    }
-
-    private func beginExistingProtocol(on conn: NWConnection) {
+    private func beginExistingProtocol(on channel: ByteChannel) {
+        self.channel = channel
+        // "Loopback" historically meant USB; physically-secured covers the
+        // AOA transport too. Read by AppDelegate to cap wireless bitrate
+        // until adaptive bitrate control lands.
+        activeClientIsLoopback = channel.trust == .physicallySecured
+        chunkSize = channel.kind == .aoa ? WireV2.aoaChunkSize : WireV2.tcpChunkSize
+        watermarkBytes = channel.kind == .aoa ? Self.aoaWatermarkBytes : Self.tcpWatermarkBytes
         startReceivingTouch()
 
         // Give new clients a short chance to opt in before the first frame.
         // Legacy clients send no capability message, so we continue shortly
-        // after this window with the old frame type.
-        networkQueue.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self, weak conn] in
-            guard let self = self, let conn = conn else { return }
-            self.finishProtocolStartup(on: conn)
+        // after this window with the old frame type. AOA clients are always
+        // current-version and their adverts can take >100ms through the USB
+        // round-trip and app scheduling — starting v1 and upgrading mid-
+        // session corrupts the stream, so give them a generous window (their
+        // type 8 still finishes startup the moment it arrives).
+        let optInWindow: DispatchTimeInterval = channel.kind == .aoa ? .seconds(2) : .milliseconds(100)
+        networkQueue.asyncAfter(deadline: .now() + optInWindow) { [weak self, weak channel] in
+            guard let self = self, let channel = channel else { return }
+            self.finishProtocolStartup(on: channel)
         }
     }
 
-    private func finishProtocolStartup(on conn: NWConnection) {
-        guard connection === conn, !isStopped, !connectionReady else { return }
+    private func finishProtocolStartup(on channel: ByteChannel) {
+        guard self.channel === channel, !isStopped, !connectionReady else { return }
 
         let codec: StreamCodec = clientIsAvcOnly ? .h264 : .hevc
-        if clientIsAvcOnly {
+        negotiatedCodec = codec
+        if v2Active {
+            // v2 announces the codec to every client via an empty videoConfig
+            // (parameter sets follow with the first keyframe).
+            enqueueControl(WireV2.encodeVideoConfig(codecId: codec.wireId, nalLengthSize: 0, parameterSets: Data()))
+            debugLog("Sent v2 codec announcement: \(codec)")
+        } else if clientIsAvcOnly {
             // Safe to send: this client opted in via type 9. Must precede the
             // display config so the client knows the codec before it sizes
             // and configures its decoder.
             let msg = Data([WireMessage.codecSelected, codec.wireId])
-            conn.send(content: msg, completion: .contentProcessed { _ in })
+            channel.send(msg, completion: nil)
             debugLog("Sent codecSelected: H.264")
         }
         // Synchronous, before sendDisplaySize(): the handler switches the
@@ -246,165 +408,8 @@ class StreamingServer {
         debugLog("Client connected - sending display config first")
         sendDisplaySize()
         connectionReady = true
-        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec))")
+        debugLog("Connection ready for frames (metadata=\(clientSupportsFrameMetadata ? "on" : "off"), codec=\(codec), v2=\(v2Active))")
         onClientConnected?()
-    }
-
-    private func runAuthHandshake(connection conn: NWConnection, expectedToken: Data) {
-        // Read fixed prefix [magic 4][token 32][name_len 1] = 37 bytes.
-        conn.receive(minimumIncompleteLength: HandshakeCodec.fixedPrefixLen,
-                     maximumLength: HandshakeCodec.fixedPrefixLen) { [weak self] prefixData, _, _, error in
-            guard let self = self else { return }
-            if let error = error {
-                debugLog("Auth read error: \(error)")
-                conn.cancel()
-                return
-            }
-            guard let prefix = prefixData, prefix.count == HandshakeCodec.fixedPrefixLen else {
-                self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                return
-            }
-            let prefixBytes = Array(prefix)
-            if Array(prefixBytes[0..<4]) == HandshakeCodec.pairingRequestMagic {
-                self.runPairingExchange(connection: conn, prefix: prefix)
-                return
-            }
-            guard Array(prefixBytes[0..<4]) == HandshakeCodec.requestMagic else {
-                self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                return
-            }
-            self.receiveNameSuffix(on: conn, prefix: prefix, onInvalid: {
-                self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-            }) { full in
-                do {
-                    let parsed = try HandshakeCodec.parseRequest(full)
-                    if WirelessAuth.validate(parsed.token, expected: expectedToken) {
-                        debugLog("Wireless auth OK — device: \(parsed.deviceName)")
-                        self.sendAuthResponse(conn, status: .ok, thenClose: false)
-                        self.onWirelessClientPaired?(parsed.deviceName)
-                        self.beginExistingProtocol(on: conn)
-                    } else {
-                        debugLog("Wireless auth rejected: token mismatch")
-                        self.sendAuthResponse(conn, status: .invalidToken, thenClose: true)
-                    }
-                } catch HandshakeError.invalidMagic {
-                    self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                } catch HandshakeError.invalidName {
-                    self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-                } catch {
-                    self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
-                }
-            }
-        }
-    }
-
-    /// Reads the variable `[name N]` tail shared by SSWA and SSPC requests and
-    /// hands back the full request bytes. `onInvalid` fires for a bad name
-    /// length or a short read; read errors cancel the connection.
-    private func receiveNameSuffix(
-        on conn: NWConnection,
-        prefix: Data,
-        onInvalid: @escaping () -> Void,
-        completion: @escaping (Data) -> Void
-    ) {
-        let nameLen = Int(Array(prefix)[36])
-        guard (1...64).contains(nameLen) else {
-            onInvalid()
-            return
-        }
-        conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { nameData, _, _, error in
-            if let error = error {
-                debugLog("Handshake name read error: \(error)")
-                conn.cancel()
-                return
-            }
-            guard let nameData = nameData, nameData.count == nameLen else {
-                onInvalid()
-                return
-            }
-            completion(prefix + nameData)
-        }
-    }
-
-    /// Handles a pre-auth "SSPC" code-pairing request (issue #35). On a valid
-    /// one-time code, answers with the real 32-byte token + Mac name and closes;
-    /// the client then reconnects through the normal SSWA handshake.
-    private func runPairingExchange(connection conn: NWConnection, prefix: Data) {
-        receiveNameSuffix(on: conn, prefix: prefix, onInvalid: { [weak self] in
-            self?.sendPairingResponse(conn, status: .invalidCode)
-        }) { [weak self] full in
-            guard let self = self else { return }
-            do {
-                let parsed = try HandshakeCodec.parsePairingRequest(full)
-                switch self.consumePairingCode(candidate: parsed.code) {
-                case .issued(let token):
-                    debugLog("Pairing code accepted — issuing token to \(parsed.deviceName)")
-                    self.sendPairingResponse(conn, status: .ok, token: token)
-                    self.onPairingSuccess?(parsed.deviceName)
-                case .rejected:
-                    debugLog("Pairing code rejected")
-                    self.sendPairingResponse(conn, status: .invalidCode)
-                case .exhausted:
-                    debugLog("Pairing code rejected — attempt budget exhausted, invalidating code")
-                    self.sendPairingResponse(conn, status: .invalidCode)
-                    self.onPairingCodeExhausted?()
-                }
-            } catch {
-                // Malformed requests carry no code guess, so they don't touch
-                // the attempt budget.
-                debugLog("Malformed pairing request: \(error)")
-                self.sendPairingResponse(conn, status: .invalidCode)
-            }
-        }
-    }
-
-    private enum PairingOutcome {
-        case issued(Data)
-        case rejected
-        case exhausted
-    }
-
-    /// Single critical section for validate-and-consume: a correct guess nils
-    /// the code before the token leaves the lock, and the attempt counter is
-    /// bumped under the same lock — so neither double redemption nor
-    /// budget-overrun is possible however requests are pipelined.
-    private func consumePairingCode(candidate: String) -> PairingOutcome {
-        pairingStateLock.withLock { state in
-            guard let expected = state.code,
-                  let token = self.expectedAuthToken,
-                  PairingCode.validate(candidate, expected: expected) else {
-                guard state.code != nil else { return .rejected }
-                state.failedAttempts += 1
-                if state.failedAttempts >= Self.maxPairingAttempts {
-                    state.code = nil
-                    state.failedAttempts = 0
-                    return .exhausted
-                }
-                return .rejected
-            }
-            state.code = nil
-            state.failedAttempts = 0
-            return .issued(token)
-        }
-    }
-
-    private func sendPairingResponse(_ conn: NWConnection, status: PairingStatus, token: Data? = nil) {
-        let bytes = HandshakeCodec.encodePairingResponse(status: status, token: token, macName: pairingMacName)
-        conn.send(content: bytes, completion: .contentProcessed { _ in
-            // Pairing connections never stream: close after the reply either
-            // way. On success the client reconnects with the issued token.
-            conn.cancel()
-        })
-    }
-
-    private func sendAuthResponse(_ conn: NWConnection, status: HandshakeStatus, thenClose: Bool) {
-        let bytes = HandshakeCodec.encodeResponse(status: status)
-        conn.send(content: bytes, completion: .contentProcessed { _ in
-            if thenClose {
-                debugLog("Auth rejected (\(status)), closing connection")
-                conn.cancel()
-            }
-        })
     }
 
     func setDisplaySize(width: Int, height: Int, rotation: Int = 0, flipHorizontal: Bool = false, flipVertical: Bool = false) {
@@ -423,16 +428,19 @@ class StreamingServer {
     }
 
     func sendDisplaySize() {
-        guard let connection = connection else { return }
+        guard let channel = channel else { return }
 
         let transform = rotation + (flipHorizontal ? 1000 : 0) + (flipVertical ? 2000 : 0)
-        var data = Data()
-        data.append(WireMessage.displayConfig)
-        data.append(contentsOf: withUnsafeBytes(of: Int32(displayWidth).bigEndian) { Data($0) })
-        data.append(contentsOf: withUnsafeBytes(of: Int32(displayHeight).bigEndian) { Data($0) })
-        data.append(contentsOf: withUnsafeBytes(of: Int32(transform).bigEndian) { Data($0) })
-
-        connection.send(content: data, completion: .contentProcessed { _ in })
+        if v2Active {
+            enqueueControl(WireV2.encodeDisplayConfig(width: displayWidth, height: displayHeight, transform: transform))
+        } else {
+            var data = Data()
+            data.append(WireMessage.displayConfig)
+            data.append(contentsOf: withUnsafeBytes(of: Int32(displayWidth).bigEndian) { Data($0) })
+            data.append(contentsOf: withUnsafeBytes(of: Int32(displayHeight).bigEndian) { Data($0) })
+            data.append(contentsOf: withUnsafeBytes(of: Int32(transform).bigEndian) { Data($0) })
+            channel.send(data, completion: nil)
+        }
         debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
     }
 
@@ -451,23 +459,24 @@ class StreamingServer {
     }
 
     private func touchReceiveLoop() {
-        guard let connection = connection, isReceiving, !isStopped else {
+        guard let channel = channel, isReceiving, !isStopped else {
             isReceiving = false
             return
         }
 
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 256) { [weak self] data, _, isComplete, error in
+        channel.receive(minimum: 1, maximum: 256) { [weak self] data, isComplete, error in
             guard let self = self, self.isReceiving, !self.isStopped else { return }
 
             if error != nil || isComplete {
                 self.isReceiving = false
                 self.inputBuffer.removeAll(keepingCapacity: true)
+                self.inputStart = 0
                 return
             }
 
             if let data = data, !data.isEmpty {
                 self.inputBuffer.append(data)
-                self.processInputBuffer(connection: connection)
+                self.processInputBuffer(channel: channel)
             }
 
             self.receiveQueue.async {
@@ -476,13 +485,18 @@ class StreamingServer {
         }
     }
 
-    private func processInputBuffer(connection: NWConnection) {
-        while let msgType = inputBuffer.first {
+    private func processInputBuffer(channel: ByteChannel) {
+        if v2InputActive {
+            processV2InputBuffer(channel: channel)
+            return
+        }
+        while inputAvailable > 0 {
+            let msgType = inputByte(at: 0)
             switch msgType {
             case WireMessage.touchEvent:
                 // Touch event: 1 type + 1 pointerCount + N*(4x+4y) + 4 action.
                 // 1 finger: 14 bytes, 2 fingers: 22 bytes.
-                guard inputBuffer.count >= 2 else { return }
+                guard inputAvailable >= 2 else { return }
 
                 let pointerCount = Int(inputByte(at: 1))
                 guard pointerCount == 1 || pointerCount == 2 else {
@@ -492,9 +506,9 @@ class StreamingServer {
                 }
 
                 let expectedSize = 2 + pointerCount * 8 + 4
-                guard inputBuffer.count >= expectedSize else { return }
+                guard inputAvailable >= expectedSize else { return }
 
-                let message = Data(inputBuffer.prefix(expectedSize))
+                let message = inputData(at: 0, count: expectedSize)
                 consumeInputBytes(expectedSize)
 
                 // Drop early if host has touch disabled, after consuming exactly
@@ -505,20 +519,20 @@ class StreamingServer {
 
             case WireMessage.ping:
                 // Ping from client: echo back as pong (type=5) with client's timestamp.
-                guard inputBuffer.count >= 9 else { return }
+                guard inputAvailable >= 9 else { return }
 
-                let clientTimestamp = Data(inputBuffer.dropFirst().prefix(8))
+                let clientTimestamp = inputData(at: 1, count: 8)
                 consumeInputBytes(9)
 
                 var pong = Data(capacity: 9)
                 pong.append(WireMessage.pong) // Type: Pong
                 pong.append(clientTimestamp)
-                connection.send(content: pong, completion: .contentProcessed { _ in })
+                channel.send(pong, completion: nil)
 
             case WireMessage.keyframeRequest:
                 // Keyframe request from Android decoder. The client sends a
                 // two-byte message: type + flags.
-                guard inputBuffer.count >= 2 else { return }
+                guard inputAvailable >= 2 else { return }
 
                 let flags = inputByte(at: 1)
                 consumeInputBytes(2)
@@ -532,7 +546,34 @@ class StreamingServer {
                     clientSupportsFrameMetadata = true
                     debugLog("Client supports video frame metadata")
                 }
-                finishProtocolStartup(on: connection)
+                if clientRequestedV2 {
+                    // Type 8 is the client's last v1 byte (it stays silent
+                    // until it sees our 13) — everything after is enveloped.
+                    v2InputActive = true
+                    v2Active = true
+                }
+                finishProtocolStartup(on: channel)
+                if v2InputActive {
+                    processV2InputBuffer(channel: channel)
+                    return
+                }
+
+            case WireV2.negotiationRequest:
+                // Payload-free v2 opt-in (same convention as types 8/9).
+                consumeInputBytes(1)
+                if connectionReady {
+                    // Startup already completed as v1 — switching formats
+                    // mid-session interleaves v1 frames with v2 envelopes and
+                    // corrupts the client's parse. Stay v1; the client
+                    // reconnects to upgrade.
+                    debugLog("v2 request after v1 startup — ignored (reconnect to upgrade)")
+                } else if !clientRequestedV2 {
+                    clientRequestedV2 = true
+                    debugLog("Client requested protocol v2 — accepting")
+                    // Only host byte before protocol startup; the client
+                    // switches its own output to v2 upon receiving it.
+                    channel.send(Data([WireV2.negotiationAccept, WireV2.version]), completion: nil)
+                }
 
             case WireMessage.clientAvcOnly:
                 // Payload-free opt-in (same convention as type 8): the client
@@ -548,7 +589,7 @@ class StreamingServer {
                 // Type + 4 payload bytes: [w-hi][w-lo][h-hi][h-lo], 7 data
                 // bits each with the high bit always set (old hosts skip the
                 // payload harmlessly). Sent BEFORE type 8, like type 9.
-                guard inputBuffer.count >= 5 else { return }
+                guard inputAvailable >= 5 else { return }
 
                 let payload = (1...4).map { inputByte(at: $0) }
                 consumeInputBytes(5)
@@ -567,6 +608,125 @@ class StreamingServer {
             default:
                 debugLog("Unknown client input type: \(msgType)")
                 consumeInputBytes(1)
+            }
+        }
+    }
+
+    /// v2 input: every client message is [type u8][len u24 BE][payload].
+    /// Unknown types are skipped by length — no more high-bit padding tricks.
+    private func processV2InputBuffer(channel: ByteChannel) {
+        while inputAvailable >= WireV2.envelopeSize {
+            guard let (type, length) = WireV2.parseEnvelope(inputData(at: 0, count: WireV2.envelopeSize)) else { return }
+            guard inputAvailable >= WireV2.envelopeSize + length else { return }
+            let payload = inputData(at: WireV2.envelopeSize, count: length)
+            consumeInputBytes(WireV2.envelopeSize + length)
+
+            switch type {
+            case WireV2.MsgType.touch.rawValue:
+                guard let count = payload.first, count == 1 || count == 2,
+                      payload.count >= 1 + Int(count) * 8 + 4 else { continue }
+                if touchEnabled {
+                    // Reuse the v1 body parser: it expects a leading type byte.
+                    handleTouchMessage(Data([WireMessage.touchEvent]) + payload, pointerCount: Int(count))
+                }
+
+            case WireV2.MsgType.ping.rawValue:
+                guard payload.count >= 8 else { continue }
+                let t0 = payload.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).bigEndian }
+                let t1 = DispatchTime.now().uptimeNanoseconds
+                enqueueControl(WireV2.encodePong(t0: t0, t1: t1, t2: DispatchTime.now().uptimeNanoseconds))
+
+            case WireV2.MsgType.keyframeRequest.rawValue:
+                guard let flags = payload.first else { continue }
+                let force = (flags & 1) != 0
+                if force {
+                    frameQueue.async { [weak self] in
+                        self?.abrForcedKeyframes += 1
+                    }
+                }
+                onKeyframeRequested?(force)
+
+            case WireV2.MsgType.clientStats.rawValue, WireV2.MsgType.nop.rawValue:
+                continue
+
+            default:
+                debugLog("Unknown v2 client message type \(type) (\(length)B) — skipped")
+            }
+        }
+    }
+
+    // MARK: - v2 send scheduler
+
+    /// Control messages (pong, display config, video config) jump the video
+    /// queue: the pump drains them between chunks, so a pong never waits
+    /// behind a multi-megabyte keyframe.
+    private func enqueueControl(_ message: Data) {
+        frameQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.controlQueue.append(message)
+            self.pumpV2Send()
+        }
+    }
+
+    /// Runs on frameQueue only. Issues sends while under the in-flight byte
+    /// watermark; each completion re-enters. Order of channel.send calls is
+    /// the wire order.
+    private func pumpV2Send() {
+        guard let channel = channel, !isStopped else { return }
+        while inflightBytes < watermarkBytes {
+            if !controlQueue.isEmpty {
+                dispatchV2(channel, controlQueue.removeFirst())
+                continue
+            }
+            if currentFrame == nil {
+                guard !pendingV2Frames.isEmpty else { break }
+                let frame = pendingV2Frames.removeFirst()
+                pendingV2Bytes -= frame.payload.count
+                currentFrame = frame
+                currentFrameId = nextFrameId
+                nextFrameId &+= 1
+                currentOffset = 0
+                var flags: UInt8 = WireV2.FrameFlags.lengthPrefixed
+                if frame.isKeyframe { flags |= WireV2.FrameFlags.keyframe }
+                dispatchV2(channel, WireV2.encodeFrameBegin(WireV2.FrameBegin(
+                    frameId: currentFrameId,
+                    totalSize: UInt32(frame.payload.count),
+                    flags: flags,
+                    captureNs: frame.captureNanos,
+                    encodeDoneNs: frame.encodeDoneNanos,
+                    sendStartNs: DispatchTime.now().uptimeNanoseconds)))
+                continue
+            }
+            guard let frame = currentFrame else { continue }
+            let payload = frame.payload
+            let take = min(chunkSize, payload.count - currentOffset)
+            dispatchV2(channel, WireV2.encodeChunkHeader(frameId: currentFrameId, chunkBytes: take))
+            // Data slice: zero-copy view sharing the encoder buffer's storage
+            // (subdata here used to copy every chunk — ~40MB/s at 300Mbps).
+            let start = payload.index(payload.startIndex, offsetBy: currentOffset)
+            let end = payload.index(start, offsetBy: take)
+            dispatchV2(channel, payload[start..<end])
+            currentOffset += take
+            if currentOffset >= payload.count {
+                let age = DispatchTime.now().uptimeNanoseconds &- frame.captureNanos
+                updateStats(bytes: payload.count, frameAgeNs: age)
+                currentFrame = nil
+            }
+        }
+        let congested = inflightBytes >= watermarkBytes
+        congestedFlag.withLock { $0 = congested }
+    }
+
+    private func dispatchV2(_ channel: ByteChannel, _ data: Data) {
+        inflightBytes += data.count
+        channel.send(data) { [weak self] error in
+            guard let self = self else { return }
+            self.frameQueue.async {
+                self.inflightBytes -= data.count
+                if error != nil {
+                    self.droppedFrames += 1
+                }
+                self.pumpV2Send()
             }
         }
     }
@@ -591,21 +751,28 @@ class StreamingServer {
     }
 
     private func inputByte(at offset: Int) -> UInt8 {
-        inputBuffer[inputBuffer.index(inputBuffer.startIndex, offsetBy: offset)]
+        inputBuffer[inputBuffer.index(inputBuffer.startIndex, offsetBy: inputStart + offset)]
     }
 
     private func consumeInputBytes(_ count: Int) {
-        let endIndex = inputBuffer.index(inputBuffer.startIndex, offsetBy: count)
-        inputBuffer.removeSubrange(inputBuffer.startIndex..<endIndex)
+        inputStart += count
+        // Compact occasionally; O(1) amortized instead of O(n) per consume.
+        if inputStart >= 4096 {
+            inputBuffer.removeSubrange(0..<inputStart)
+            inputStart = 0
+        } else if inputStart == inputBuffer.count {
+            inputBuffer.removeAll(keepingCapacity: true)
+            inputStart = 0
+        }
     }
 
-    func sendFrame(_ data: Data, timestamp: UInt64, isKeyframe: Bool = false) {
-        guard let connection = connection, !isStopped, connectionReady else { return }
+    func sendFrame(_ frame: EncodedFrame) {
+        guard let channel = channel, !isStopped, connectionReady else { return }
 
         // With short-GOP encoding, a fresh client must start on a keyframe —
         // sending P-frames before the first IDR would feed garbage to its decoder.
         if waitingForSyncFrame {
-            guard isKeyframe else {
+            guard frame.isKeyframe else {
                 droppedFrames += 1
                 return
             }
@@ -613,23 +780,71 @@ class StreamingServer {
             debugLog("First keyframe sent to new client")
         }
 
+        if v2Active {
+            frameQueue.async { [weak self] in
+                self?.enqueueV2Frame(frame)
+            }
+            return
+        }
+
+        // Legacy v1 path: convert to Annex-B (in-band parameter sets before
+        // keyframes) — byte-identical to the pre-refactor stream.
         // No frame-age dropping or backpressure — send everything immediately.
         // The encode queue depth limit (2 pending) in ScreenCapture handles flow control.
         frameQueue.async { [weak self] in
             guard let self = self else { return }
 
-            let packet = self.makeFramePacket(data, timestamp: timestamp, isKeyframe: isKeyframe)
+            let annexB = Bitstream.annexB(from: frame, codec: self.negotiatedCodec)
+            let packet = self.makeFramePacket(annexB, timestamp: frame.captureNanos, isKeyframe: frame.isKeyframe)
 
-            connection.send(content: packet, completion: .contentProcessed { error in
+            channel.send(packet) { error in
                 if error != nil {
                     self.droppedFrames += 1
                 }
-            })
+            }
 
             // Track frame age at send time for pipeline profiling
-            let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
-            self.updateStats(bytes: data.count, frameAgeNs: sendAge)
+            let sendAge = DispatchTime.now().uptimeNanoseconds - frame.captureNanos
+            self.updateStats(bytes: annexB.count, frameAgeNs: sendAge)
         }
+    }
+
+    /// frameQueue only. Emits a videoConfig ahead of the keyframe whenever the
+    /// encoder's format description changed, then queues the frame for the
+    /// pump. When the link is badly backlogged the queue is cleared and the
+    /// stream resyncs on the next keyframe (frames must never be dropped
+    /// individually — IPP reference chains).
+    private func enqueueV2Frame(_ frame: EncodedFrame) {
+        if needKeyframeResync {
+            guard frame.isKeyframe else {
+                droppedFrames += 1
+                return
+            }
+            needKeyframeResync = false
+        }
+        if frame.isKeyframe, let format = frame.formatDescription, format !== lastSentFormat {
+            lastSentFormat = format
+            let sets = Bitstream.parameterSets(from: format, codec: negotiatedCodec)
+            controlQueue.append(WireV2.encodeVideoConfig(codecId: negotiatedCodec.wireId, nalLengthSize: 4, parameterSets: sets))
+            debugLog("v2 videoConfig queued (\(sets.count)B parameter sets)")
+        }
+        pendingV2Frames.append(frame)
+        pendingV2Bytes += frame.payload.count
+        if pendingV2Bytes > Self.maxQueuedV2Bytes {
+            // Deep backlog: drop everything and restart at an IDR. Byte-based
+            // cap so the worst-case memory (pinned CMSampleBuffers) stays
+            // fixed regardless of frame size.
+            droppedFrames += UInt64(pendingV2Frames.count)
+            pendingV2Frames.removeAll()
+            pendingV2Bytes = 0
+            needKeyframeResync = true
+            debugLog("v2 send queue overflow — resyncing on next keyframe")
+            // With an open GOP nobody else will produce that IDR: the client
+            // is starved (its watchdogs live in the frame-receive path), so
+            // the HOST must ask its own encoder or the stream freezes.
+            onKeyframeRequested?(true)
+        }
+        pumpV2Send()
     }
 
     private func makeFramePacket(_ data: Data, timestamp: UInt64, isKeyframe: Bool) -> Data {
@@ -696,14 +911,15 @@ class StreamingServer {
     func stop() {
         isStopped = true
         isReceiving = false
+        stopAdaptiveBitrate()
 
         // Wait for pending operations before cancelling
         frameQueue.sync {}
         receiveQueue.sync {}
 
-        connection?.cancel()
-        listener?.cancel()
-        connection = nil
-        listener = nil
+        channel?.cancel()
+        tcpSource.stop()
+        aoaSource?.stop()
+        channel = nil
     }
 }

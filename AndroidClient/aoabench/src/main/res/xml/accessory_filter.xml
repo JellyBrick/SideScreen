@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MUST match AOAConstants.manufacturer/model in MacHost/AOATest. -->
+<resources>
+    <usb-accessory
+        manufacturer="SideScreen"
+        model="AOABench" />
+</resources>

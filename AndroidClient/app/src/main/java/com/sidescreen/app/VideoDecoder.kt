@@ -43,7 +43,13 @@ class VideoDecoder(
 
     private val frameTimes = ArrayDeque<Long>(120)
 
-    private val displayRefreshRate = display?.refreshRate ?: 60f
+    // Panel MAX mode, not the current one: the 120Hz mode switch we request
+    // at connect is asynchronous, so display.refreshRate often still reads 60
+    // when the decoder is built — and KEY_OPERATING_RATE=60 lets vendor
+    // decoders pace themselves to ~60fps. A higher-than-actual hint is safe.
+    private val displayRefreshRate =
+        display?.supportedModes?.maxOfOrNull { it.refreshRate }
+            ?: display?.refreshRate ?: 60f
 
     private var currentWidth = initialWidth
     private var currentHeight = initialHeight
@@ -147,12 +153,19 @@ class VideoDecoder(
 
         var configured = false
 
+        // Input buffers must fit the largest expected frame. Sized from the
+        // stream resolution instead of a blanket 16MB: vendor decoders may
+        // PREALLOCATE maxInputSize per input buffer, and 4-8 x 16MB was up to
+        // 128MB of native heap for nothing.
+        val maxInputSize = (currentWidth * currentHeight * 3 / 4).coerceAtLeast(4 * 1024 * 1024)
+
         // Attempt 1: Full low-latency config
         try {
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
             format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxInputSize)
             codec.configure(format, surface, null, 0)
             configured = true
             diagLog("Configured with full low-latency")
@@ -173,6 +186,7 @@ class VideoDecoder(
                     )
                 basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
                 basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                basicFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxInputSize)
                 codec.configure(basicFormat, surface, null, 0)
                 configured = true
                 diagLog("Configured with basic format")
@@ -222,6 +236,19 @@ class VideoDecoder(
      * Returns codec name to use with MediaCodec.createByCodecName(), or null for default.
      */
     private fun findBestDecoder(
+        width: Int,
+        height: Int,
+    ): String? {
+        val cacheKey = "$mime:${width}x$height@${displayRefreshRate.toInt()}"
+        decoderChoiceCache[cacheKey]?.let { cached ->
+            return if (cached == DECODER_CACHE_NONE) null else cached
+        }
+        val chosen = scanForBestDecoder(width, height)
+        decoderChoiceCache[cacheKey] = chosen ?: DECODER_CACHE_NONE
+        return chosen
+    }
+
+    private fun scanForBestDecoder(
         width: Int,
         height: Int,
     ): String? {
@@ -374,6 +401,18 @@ class VideoDecoder(
             val inputBuffer =
                 codec.getInputBuffer(index)
                     ?: throw IllegalStateException("Input buffer $index is null")
+            if (inputBuffer.capacity() < frameSize) {
+                // Codec ignored KEY_MAX_INPUT_SIZE (minimal-config fallback or
+                // vendor quirk). Give the index back and resync on an IDR
+                // instead of throwing BufferOverflow into the catch below.
+                availableInputBuffers.offer(index)
+                needsKeyframe = true
+                requestKeyframe(
+                    "frame ${frameSize}B exceeds input buffer ${inputBuffer.capacity()}B",
+                    force = true,
+                )
+                return
+            }
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
@@ -545,7 +584,17 @@ class VideoDecoder(
         private const val STALL_DETECT_INPUT_FRAMES = 120L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
         private const val FORCE_KEYFRAME_REQUEST_INTERVAL_NS = 200_000_000L
-        private const val MAX_RENDER_LATENCY_NS = 100_000_000L
+
+        // 50ms: with pre-decode dropping upstream (StreamClient's queue) the
+        // decoder rarely runs late; when it does, showing a frame more than
+        // 3 vsyncs stale only adds perceived lag.
+        private const val MAX_RENDER_LATENCY_NS = 50_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
+
+        // Decoder selection is expensive (full MediaCodecList scan +
+        // capability queries, 50-200ms on some devices) and repeats on every
+        // reconnect/codec renegotiation — cache per (mime, size, rate).
+        private val decoderChoiceCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+        private const val DECODER_CACHE_NONE = ""
     }
 }

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MUST match AOAConstants.manufacturer/model in MacHost/Sources/AOA/AOAUSB.swift. -->
+<resources>
+    <usb-accessory
+        manufacturer="SideScreen"
+        model="SideScreen" />
+</resources>

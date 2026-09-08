@@ -36,6 +36,7 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
+import com.sidescreen.app.transport.AoaTransport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
@@ -53,6 +54,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
+    private var accessoryManager: AccessoryConnectionManager? = null
+
+    /**
+     * One connection attempt at a time. Attach intents, permission grants,
+     * onResume scans and the Connect button can all fire connect() — without
+     * this guard the attempts open/close the accessory descriptor under each
+     * other's preamble reads.
+     */
+    private val connectGuard = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Last AOA attempt time — failed attempts back off instead of storming. */
+    @Volatile private var lastAoaAttemptMs = 0L
 
     /** In-flight code-pairing attempt (issue #35); cancelled when its dialog closes. */
     private var pairingJob: Job? = null
@@ -116,7 +129,58 @@ class MainActivity : AppCompatActivity() {
         startChecklistUpdates()
         setupModeToggle()
         setupWirelessController()
+
+        accessoryManager =
+            AccessoryConnectionManager(
+                activity = this,
+                onAccessoryReady = {
+                    // Attach intent or permission grant: connect via AOA when
+                    // idle. The attach can race the death of a TCP session the
+                    // Mac just preempted (the switch cuts adb), so retry once
+                    // after the disconnect has had time to land.
+                    runOnUiThread {
+                        if (!isConnected) {
+                            updateStatus("USB direct available — connecting…")
+                            connect("127.0.0.1", currentPort())
+                        } else {
+                            binding.root.postDelayed({
+                                if (!isConnected) {
+                                    updateStatus("USB direct available — connecting…")
+                                    connect("127.0.0.1", currentPort())
+                                }
+                            }, 1500)
+                        }
+                    }
+                },
+                onAccessoryDetached = {
+                    mainDiag("USB accessory detached")
+                },
+            )
+        accessoryManager?.handleIntent(intent)
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        accessoryManager?.handleIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // The Mac switches us into accessory mode on its own schedule; the
+        // ATTACHED intent only reaches us via the system dialog. Scan on
+        // resume so an already-waiting accessory connects without one.
+        if (!isConnected && accessoryManager?.hasAccessory() == true) {
+            mainDiag("Accessory present on resume — connecting via AOA")
+            updateStatus("USB direct available — connecting…")
+            connect("127.0.0.1", currentPort())
+        }
+    }
+
+    private fun currentPort(): Int =
+        binding.portInput.text
+            .toString()
+            .toIntOrNull() ?: 54321
 
     private fun setupModeToggle() {
         // Restore previous mode and reflect in toggle.
@@ -364,12 +428,55 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.surfaceView.setOnTouchListener { view, event ->
+            // Unbuffered dispatch: MOVE events skip vsync batching (~4-8ms
+            // saved). Requested per-gesture, on DOWN.
+            if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                view.requestUnbufferedDispatch(event)
+            }
             handleTouch(view, event)
             true
         }
         binding.textureView.setOnTouchListener { view, event ->
+            if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                view.requestUnbufferedDispatch(event)
+            }
             handleTouch(view, event)
             true
+        }
+    }
+
+    /**
+     * Ask for the panel's highest refresh mode at the stream resolution class
+     * (many tablets idle at 60Hz even with a 120Hz panel — halving the vsync
+     * grid halves the average latch wait). Safe no-op when unsupported.
+     */
+    private fun applyHighRefreshRate() {
+        try {
+            val displayObj =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    display
+                } else {
+                    @Suppress("DEPRECATION")
+                    windowManager.defaultDisplay
+                } ?: return
+            val modes = displayObj.supportedModes
+            val current = displayObj.mode
+            val best =
+                modes
+                    .filter {
+                        it.physicalWidth == current.physicalWidth &&
+                            it.physicalHeight == current.physicalHeight
+                    }.maxByOrNull { it.refreshRate } ?: return
+            if (best.modeId != current.modeId) {
+                window.attributes = window.attributes.apply { preferredDisplayModeId = best.modeId }
+                mainDiag("Requested display mode ${best.refreshRate}Hz (was ${current.refreshRate}Hz)")
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                binding.surfaceView.holder.surface
+                    ?.setFrameRate(best.refreshRate, android.view.Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            }
+        } catch (e: Exception) {
+            mainDiag("applyHighRefreshRate failed: ${e.message}")
         }
     }
 
@@ -1037,6 +1144,14 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // v2 only: capture→receive wire age percentiles via the synced clock.
+        streamClient?.onWireStats = { rttMs, _, wireP50, wireP95 ->
+            runOnUiThread {
+                binding.latencyText.text =
+                    String.format("%.1f ms | wire %.0f/%.0f", rttMs, wireP50, wireP95)
+            }
+        }
+
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
@@ -1266,6 +1381,10 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        if (!connectGuard.compareAndSet(false, true)) {
+            mainDiag("connect() skipped — attempt already in flight")
+            return
+        }
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
@@ -1320,6 +1439,8 @@ class MainActivity : AppCompatActivity() {
                         )
 
                         if (connected) {
+                            applyHighRefreshRate()
+
                             // Start periodic ping for latency measurement
                             startPingTimer()
 
@@ -1380,6 +1501,28 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                // USB direct (AOA) first when the Mac has switched us into
+                // accessory mode; silently fall back to the adb TCP path.
+                // Failed attempts back off 3s: rapid open/close cycles feed
+                // the Mac stale half-handshakes and amplify recovery churn.
+                val nowMs = android.os.SystemClock.elapsedRealtime()
+                val aoaDescriptor =
+                    if (nowMs - lastAoaAttemptMs >= AOA_RETRY_BACKOFF_MS) {
+                        accessoryManager?.openIfAvailable()
+                    } else {
+                        null
+                    }
+                if (aoaDescriptor != null) {
+                    lastAoaAttemptMs = nowMs
+                    try {
+                        log("Connecting via USB direct (AOA)…")
+                        streamClient?.connectAoa(AoaTransport(aoaDescriptor))
+                        return@launch
+                    } catch (e: Exception) {
+                        mainDiag("AOA connect failed (${e.message}) — falling back to adb TCP")
+                        accessoryManager?.closeActive()
+                    }
+                }
                 streamClient?.connect()
             } catch (e: Exception) {
                 val errorMessage =
@@ -1405,6 +1548,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 updateStatus("Connection failed")
                 showError(errorMessage)
+            } finally {
+                // connect()/connectAoa() only return after the session ends
+                // (or setup fails) — either way a new attempt may start now.
+                connectGuard.set(false)
             }
         }
     }
@@ -1579,6 +1726,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopChecklistUpdates()
+        accessoryManager?.release()
         cleanup()
     }
 
@@ -1727,5 +1875,9 @@ class MainActivity : AppCompatActivity() {
                 // ignore
             }
         }
+    }
+
+    companion object {
+        private const val AOA_RETRY_BACKOFF_MS = 3_000L
     }
 }

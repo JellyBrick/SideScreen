@@ -76,8 +76,76 @@ class ScreenCapture {
 
     // Encoding pipeline state (captured by frame handler closure)
     private var encodeQueue: DispatchQueue?
-    private var pendingEncodes: Int32 = 0
-    private var lastPixelBuffer: CVPixelBuffer?
+
+    private struct EncodePipelineState {
+        var pendingEncodes = 0
+        var lastPixelBuffer: CVPixelBuffer?
+        var congestedSkipToggle = false
+        var congestedDrops = 0
+        var admissionDrops = 0
+    }
+
+    /// Guards the encode admission counter and the cached frame. Replaces the
+    /// deprecated OSAtomic counter and closes the lastPixelBuffer data race
+    /// (SCStream callback thread wrote it while other threads read it).
+    private let pipelineLock = OSAllocatedUnfairLock(initialState: EncodePipelineState())
+    private var currentRequestBasedKeyframes = false
+
+    private enum FrameSource {
+        case capture        // live frames — droppable before encode
+        case keepalive      // idle-screen re-encode — rare, higher ceiling
+        case keyframeReplay // client-sync replay — rare, higher ceiling
+    }
+
+    /// Single admission point for every path that feeds the encoder. Frames
+    /// are only ever dropped BEFORE encoding: dropping an encoded P-frame
+    /// would break the IPP reference chain on the client. Transport
+    /// congestion (send watermark exceeded) also gates capture frames here.
+    private func submitFrame(_ pixelBuffer: CVPixelBuffer, pts: CMTime, source: FrameSource) {
+        let congested = source == .capture && currentServer?.isCongested == true
+        let limit = source == .capture ? 3 : 4
+        let admitted = pipelineLock.withLock { state -> Bool in
+            if congested {
+                // Halve the rate under congestion instead of gating to zero:
+                // an all-or-nothing gate turned every animation burst into a
+                // 30-40ms hole (the visible transition stutter).
+                state.congestedSkipToggle.toggle()
+                if state.congestedSkipToggle {
+                    state.congestedDrops += 1
+                    if state.congestedDrops % 300 == 1 {
+                        debugLog("Capture drops — congestion: \(state.congestedDrops), admission: \(state.admissionDrops)")
+                    }
+                    return false
+                }
+            }
+            guard state.pendingEncodes < limit else {
+                if source == .capture {
+                    state.admissionDrops += 1
+                }
+                return false
+            }
+            state.pendingEncodes += 1
+            if source == .capture {
+                state.lastPixelBuffer = pixelBuffer
+            }
+            return true
+        }
+        guard admitted else { return }
+        let work = { [weak self] in
+            guard let self = self else { return }
+            self.encoder?.encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts)
+            self.pipelineLock.withLock { $0.pendingEncodes -= 1 }
+        }
+        if let queue = encodeQueue {
+            queue.async(execute: work)
+        } else {
+            work()
+        }
+    }
+
+    private var cachedPixelBuffer: CVPixelBuffer? {
+        pipelineLock.withLock { $0.lastPixelBuffer }
+    }
 
     /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
     var onCaptureMethodChanged: ((String) -> Void)?
@@ -112,16 +180,14 @@ class ScreenCapture {
 
         requestKeyframe()
 
-        guard let encoder, let cached = lastPixelBuffer else { return }
+        guard encoder != nil, let cached = cachedPixelBuffer else { return }
 
         let pts = CMTime(
             value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
             timescale: 1_000_000
         )
 
-        encodeQueue?.async {
-            encoder.encode(pixelBuffer: cached, presentationTimeStamp: pts)
-        }
+        submitFrame(cached, pts: pts, source: .keyframeReplay)
     }
 
     var displayWidth: Int {
@@ -144,8 +210,32 @@ class ScreenCapture {
     /// client's reported decoder limit when known, else to the conservative
     /// AVC floor when streaming H.264. SCStream/CGDisplayStream scale the
     /// capture into this size, so no virtual-display change is needed.
+    /// Pixel-RATE budget for the encode size: a single Apple media engine
+    /// (and the tablet-class HEVC decoder) sustains roughly ~660Mpixel/s, so
+    /// the per-frame pixel cap follows the TARGET FPS instead of being a
+    /// constant. At 120fps a 3840×2400 HiDPI capture (9.2MP) gets scaled to
+    /// ~5.5MP (≈ tablet panel resolution — the client downscaled to that
+    /// anyway, so bits/pixel actually improves); at 60fps the full HiDPI
+    /// resolution fits the budget and passes through untouched. The cap
+    /// affects the ENCODE only; the virtual display stays HiDPI and SCStream
+    /// downscales on the GPU before encoding.
+    private static let maxEncodePixelRate = 660_000_000
+
+    /// User opt-in (Settings → "Auto resolution cap for FPS"). Off by
+    /// default: resolution is never touched unless the user asks for it.
+    var throughputCapEnabled = false
+
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
-        let phys = (displayWidth, displayHeight)
+        var phys = (displayWidth, displayHeight)
+        let pixels = phys.0 * phys.1
+        let maxPixels = Self.maxEncodePixelRate / max(30, currentFrameRate)
+        if throughputCapEnabled, pixels > maxPixels {
+            let scale = (Double(maxPixels) / Double(pixels)).squareRoot()
+            let w = max(16, Int(Double(phys.0) * scale) & ~15)
+            let h = max(16, Int(Double(phys.1) * scale) & ~15)
+            debugLog("Encode size capped for \(currentFrameRate)fps throughput: \(phys.0)x\(phys.1) → \(w)x\(h)")
+            phys = (w, h)
+        }
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
         if let limit = clientDecodeLimit {
@@ -362,8 +452,10 @@ class ScreenCapture {
     private func configureFrameHandler(label: String) {
         let queue = DispatchQueue(label: "encodeQueue.\(label)", qos: .userInteractive)
         encodeQueue = queue
-        pendingEncodes = 0
-        lastPixelBuffer = nil
+        pipelineLock.withLock { state in
+            state.pendingEncodes = 0
+            state.lastPixelBuffer = nil
+        }
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
@@ -385,25 +477,10 @@ class ScreenCapture {
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
-            // Backpressure: skip if encode queue already has 2+ frames pending
-            let pending = OSAtomicAdd32(0, &self.pendingEncodes)
-            if pending >= 2 {
-                return
-            }
-
             if let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                self.lastPixelBuffer = imageBuffer
-                OSAtomicIncrement32(&self.pendingEncodes)
-                queue.async {
-                    self.encoder?.encode(pixelBuffer: imageBuffer, presentationTimeStamp: pts)
-                    OSAtomicDecrement32(&self.pendingEncodes)
-                }
-            } else if let cached = self.lastPixelBuffer {
-                OSAtomicIncrement32(&self.pendingEncodes)
-                queue.async {
-                    self.encoder?.encode(pixelBuffer: cached, presentationTimeStamp: pts)
-                    OSAtomicDecrement32(&self.pendingEncodes)
-                }
+                self.submitFrame(imageBuffer, pts: pts, source: .capture)
+            } else if let cached = self.cachedPixelBuffer {
+                self.submitFrame(cached, pts: pts, source: .capture)
             }
         }
     }
@@ -428,8 +505,9 @@ class ScreenCapture {
         let (width, height) = encodeSize(for: codec)
 
         encoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost, frameRate: frameRate)
-        encoder?.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
-            server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
+        encoder?.setRequestBasedKeyframes(currentRequestBasedKeyframes)
+        encoder?.onEncodedFrame = { [weak server] frame in
+            server?.sendFrame(frame)
         }
 
         // Apply any keyframe request that arrived before the encoder existed
@@ -495,16 +573,14 @@ class ScreenCapture {
             if stalled {
                 let hasHadFrames = self.stateLock.withLock { $0.hasReceivedFirstFrame }
 
-                if hasHadFrames, let lastBuffer = self.lastPixelBuffer {
+                if hasHadFrames, let lastBuffer = self.cachedPixelBuffer {
                     // Screen is idle — SCStream is healthy but not delivering frames (macOS optimization).
                     // Re-send the last captured frame as a keepalive so the tablet stays connected.
                     let pts = CMTime(
                         value: CMTimeValue(DispatchTime.now().uptimeNanoseconds / 1000),
                         timescale: 1_000_000
                     )
-                    self.encodeQueue?.async {
-                        self.encoder?.encode(pixelBuffer: lastBuffer, presentationTimeStamp: pts)
-                    }
+                    self.submitFrame(lastBuffer, pts: pts, source: .keepalive)
                     self.stateLock.withLock { $0.lastFrameTime = DispatchTime.now() }
                     // Keep monitoring — real errors are handled by the SCStream error delegate
                 } else {
@@ -699,7 +775,7 @@ class ScreenCapture {
 
                 // Use CMClock for accurate timestamps instead of raw Mach time
                 let pts = CMClockGetTime(CMClockGetHostTimeClock())
-                self.encoder?.encode(pixelBuffer: pb, presentationTimeStamp: pts)
+                self.submitFrame(pb, pts: pts, source: .capture)
             }
         ) else {
             debugLog("Failed to create CGDisplayStream — fallback unavailable")
@@ -722,6 +798,24 @@ class ScreenCapture {
 
     func updateEncoderSettings(bitrateMbps: Int, quality: String, gamingBoost: Bool) {
         encoder?.updateSettings(bitrateMbps: bitrateMbps, quality: quality, gamingBoost: gamingBoost)
+    }
+
+    /// v2 clients get request-based IDR (open GOP); v1 keeps the 1s GOP.
+    /// Persisted so codec renegotiation (encoder rebuild) keeps the policy.
+    func setRequestBasedKeyframes(_ enabled: Bool) {
+        currentRequestBasedKeyframes = enabled
+        encoder?.setRequestBasedKeyframes(enabled)
+    }
+
+    /// Adaptive bitrate entry point (serialized with encoding).
+    func setLiveBitrate(mbps: Int) {
+        if let queue = encodeQueue {
+            queue.async { [weak self] in
+                self?.encoder?.setLiveBitrate(mbps: mbps)
+            }
+        } else {
+            encoder?.setLiveBitrate(mbps: mbps)
+        }
     }
 
     /// Switch the wire codec. No-op when unchanged. When changed mid-stream,
@@ -760,8 +854,9 @@ class ScreenCapture {
         let (width, height) = encodeSize(for: codec)
         let server = currentServer
         let newEncoder = VideoEncoder(width: width, height: height, codec: codec, bitrateMbps: currentBitrateMbps, quality: currentQuality, gamingBoost: currentGamingBoost, frameRate: currentFrameRate)
-        newEncoder.onEncodedFrame = { [weak server] data, timestamp, isKeyframe in
-            server?.sendFrame(data, timestamp: timestamp, isKeyframe: isKeyframe)
+        newEncoder.setRequestBasedKeyframes(currentRequestBasedKeyframes)
+        newEncoder.onEncodedFrame = { [weak server] frame in
+            server?.sendFrame(frame)
         }
         newEncoder.requestKeyframe()
         encoder = newEncoder

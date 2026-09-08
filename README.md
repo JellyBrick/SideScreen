@@ -83,7 +83,7 @@ Enable HiDPI mode to render at 2× resolution internally — text and icons are 
 
 ### Gaming Mode
 
-Enable Gaming Boost for optimized settings: 1 Gbps bitrate, ultra-low latency encoding, 120 FPS.
+Enable Gaming Boost for latency-first settings: speed-first encoder tuning, ultra-low latency encoding, 120 FPS. Bitrate follows your slider setting.
 
 ### Customizable
 
@@ -195,7 +195,7 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 | Bitrate | 20–5000 Mbps | 1000 Mbps |
 | Quality | Ultra Low, Low, Medium, High | Ultra Low |
 | HiDPI (Retina) | On/Off | Off |
-| Gaming Boost | On/Off (1 Gbps, 120 Hz) | Off |
+| Gaming Boost | On/Off (speed-first encoding, 120 Hz) | Off |
 | Touch Input | On/Off | On |
 
 ---

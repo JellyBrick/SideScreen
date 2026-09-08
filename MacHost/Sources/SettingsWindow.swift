@@ -495,6 +495,27 @@ struct SettingsView: View {
                                         .font(.system(size: 10))
                                         .foregroundColor(.orange)
                                 }
+
+                                Divider()
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("USB Direct (beta)")
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text("Bulk USB transport — lower latency than adb; falls back automatically")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Toggle("", isOn: $settings.usbDirectEnabled)
+                                        .labelsHidden()
+                                }
+
+                                if settings.usbDirectEnabled {
+                                    Text("Takes effect on the next streaming start")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
 
@@ -630,7 +651,7 @@ struct SettingsView: View {
                                             Image(systemName: "checkmark.circle.fill")
                                                 .foregroundColor(.green)
                                                 .font(.system(size: 10))
-                                            Text("High bitrate (1000 Mbps)")
+                                            Text("Speed-first encoder tuning")
                                                 .font(.system(size: 11))
                                         }
                                         HStack(spacing: 4) {
@@ -670,19 +691,19 @@ struct SettingsView: View {
                                     }
 
                                     HStack(spacing: 6) {
-                                        BitrateButton(label: "100", value: 100, currentValue: settings.bitrate, disabled: settings.gamingBoost) {
+                                        BitrateButton(label: "100", value: 100, currentValue: settings.bitrate, disabled: false) {
                                             settings.bitrate = 100
                                         }
-                                        BitrateButton(label: "300", value: 300, currentValue: settings.bitrate, disabled: settings.gamingBoost) {
+                                        BitrateButton(label: "300", value: 300, currentValue: settings.bitrate, disabled: false) {
                                             settings.bitrate = 300
                                         }
-                                        BitrateButton(label: "500", value: 500, currentValue: settings.bitrate, disabled: settings.gamingBoost) {
+                                        BitrateButton(label: "500", value: 500, currentValue: settings.bitrate, disabled: false) {
                                             settings.bitrate = 500
                                         }
-                                        BitrateButton(label: "1000", value: 1000, currentValue: settings.bitrate, disabled: settings.gamingBoost) {
+                                        BitrateButton(label: "1000", value: 1000, currentValue: settings.bitrate, disabled: false) {
                                             settings.bitrate = 1000
                                         }
-                                        BitrateButton(label: "2000", value: 2000, currentValue: settings.bitrate, disabled: settings.gamingBoost) {
+                                        BitrateButton(label: "2000", value: 2000, currentValue: settings.bitrate, disabled: false) {
                                             settings.bitrate = 2000
                                         }
                                     }
@@ -695,20 +716,9 @@ struct SettingsView: View {
                                             get: { Double(settings.bitrate) },
                                             set: { settings.bitrate = Int($0) }
                                         ), in: 20...5000, step: 10)
-                                        .disabled(settings.gamingBoost)
                                         Text("5000")
                                             .font(.system(size: 9))
                                             .foregroundColor(.secondary)
-                                    }
-
-                                    if settings.gamingBoost {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "bolt.fill")
-                                                .font(.system(size: 10))
-                                            Text("Locked at 1000 Mbps in Gaming Boost")
-                                                .font(.system(size: 10))
-                                        }
-                                        .foregroundColor(.orange)
                                     }
                                 }
 
@@ -736,6 +746,27 @@ struct SettingsView: View {
                                             .font(.system(size: 10))
                                             .foregroundColor(.green)
                                     }
+                                }
+
+                                Divider()
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Auto resolution cap for FPS")
+                                            .font(.system(size: 12, weight: .medium))
+                                        Text("Downscale encoding when resolution × FPS exceeds the hardware encoder (e.g. HiDPI @ 120fps)")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Toggle("", isOn: $settings.encodeThroughputCap)
+                                        .labelsHidden()
+                                }
+
+                                if !settings.encodeThroughputCap {
+                                    Text("Off: full resolution always — frame rate may fall below the target instead")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
                                 }
                             }
                         }
@@ -1212,6 +1243,20 @@ class DisplaySettings: ObservableObject {
     @Published var touchEnabled: Bool {
         didSet { save("touchEnabled", touchEnabled) }
     }
+
+    /// USB direct (AOA bulk) transport — beta. Default off; falls back to
+    /// adb reverse automatically when the device or link does not cooperate.
+    @Published var usbDirectEnabled: Bool {
+        didSet { save("usbDirectEnabled", usbDirectEnabled) }
+    }
+
+    /// Opt-in encode resolution cap: when the pixel rate (resolution × fps)
+    /// exceeds what a single hardware encoder sustains, downscale the encode
+    /// on the GPU to hold the target fps. Off (default) = never touch the
+    /// resolution; the frame rate sags instead.
+    @Published var encodeThroughputCap: Bool {
+        didSet { save("encodeThroughputCap", encodeThroughputCap) }
+    }
     @Published var connectionMode: ConnectionMode {
         didSet { save("connectionMode", connectionMode.rawValue) }
     }
@@ -1262,6 +1307,8 @@ class DisplaySettings: ObservableObject {
         self.customWidth = defaults.object(forKey: keyPrefix + "customWidth") as? Int ?? 1920
         self.customHeight = defaults.object(forKey: keyPrefix + "customHeight") as? Int ?? 1200
         self.touchEnabled = defaults.object(forKey: keyPrefix + "touchEnabled") as? Bool ?? true
+        self.usbDirectEnabled = defaults.object(forKey: keyPrefix + "usbDirectEnabled") as? Bool ?? false
+        self.encodeThroughputCap = defaults.object(forKey: keyPrefix + "encodeThroughputCap") as? Bool ?? false
         let modeRaw = defaults.string(forKey: keyPrefix + "connectionMode") ?? ConnectionMode.usb.rawValue
         self.connectionMode = ConnectionMode(rawValue: modeRaw) ?? .usb
         self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
@@ -1311,8 +1358,10 @@ class DisplaySettings: ObservableObject {
         resolutionGroups.flatMap { $0.resolutions }
     }
 
+    // Gaming Boost no longer overrides bitrate: it is a latency-first preset
+    // (120 Hz + speed-first encoder quality); the bitrate follows the slider.
     var effectiveBitrate: Int {
-        return gamingBoost ? 1000 : bitrate
+        return bitrate
     }
 
     var effectiveQuality: String {

@@ -5,20 +5,34 @@ import ApplicationServices
 import os.log
 @preconcurrency import ScreenCaptureKit
 
-// Debug file logger - writes to /tmp/sidescreen.log
+// Debug file logger - writes to /tmp/sidescreen.log.
+// One persistent handle + a serial queue: the old version opened, seeked and
+// closed the file on every call, which showed up in fs_usage during streaming.
+private let debugLogQueue = DispatchQueue(label: "debugLog", qos: .utility)
+private let debugLogHandle: FileHandle? = {
+    let path = "/tmp/sidescreen.log"
+    if !FileManager.default.fileExists(atPath: path) {
+        FileManager.default.createFile(atPath: path, contents: nil)
+    }
+    let handle = FileHandle(forWritingAtPath: path)
+    handle?.seekToEndOfFile()
+    return handle
+}()
+
+private let debugLogFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.dateStyle = .none
+    formatter.timeStyle = .medium
+    return formatter
+}()
+
 func debugLog(_ message: String) {
-    let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+    let timestamp = debugLogFormatter.string(from: Date())
     let line = "[\(timestamp)] \(message)\n"
     print(message)
-    if let data = line.data(using: .utf8) {
-        let url = URL(fileURLWithPath: "/tmp/sidescreen.log")
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
-            try? data.write(to: url)
-        }
+    guard let data = line.data(using: .utf8) else { return }
+    debugLogQueue.async {
+        debugLogHandle?.write(data)
     }
 }
 
@@ -200,6 +214,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Temporary guard until adaptive bitrate control lands: Wi-Fi links
+    /// cannot absorb the USB-class defaults (up to 5000 Mbps) and the stream
+    /// has no send backpressure yet, so a wireless client would drown in
+    /// seconds of queued video. USB (loopback) clients pass through as-is.
+    static let wirelessBitrateCapMbps = 150
+
+    private func encoderBitrate(for userBitrateMbps: Int) -> Int {
+        let wireless = streamingServer?.activeClientIsLoopback == false
+        return wireless ? min(userBitrateMbps, Self.wirelessBitrateCapMbps) : userBitrateMbps
+    }
+
     func setupSettingsObservers() {
         // Observer cho gaming boost changes
         settings.$gamingBoost
@@ -208,23 +233,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self, self.settings.isRunning else { return }
                 print("🎮 Gaming Boost \(gamingBoost ? "ENABLED" : "DISABLED")")
                 self.screenCapture?.updateEncoderSettings(
-                    bitrateMbps: self.settings.effectiveBitrate,
+                    bitrateMbps: self.encoderBitrate(for: self.settings.effectiveBitrate),
                     quality: self.settings.effectiveQuality,
                     gamingBoost: gamingBoost
                 )
             }
             .store(in: &cancellables)
 
-        // Observer cho bitrate/quality changes (chỉ khi không gaming boost)
+        // Observer cho bitrate/quality changes. Gaming Boost no longer locks
+        // the bitrate, so slider changes apply in every mode; the encoder
+        // ignores the quality string while boosting (speed-first preset).
         Publishers.CombineLatest(settings.$bitrate, settings.$quality)
             .dropFirst()
             .sink { [weak self] bitrate, quality in
-                guard let self = self, self.settings.isRunning, !self.settings.gamingBoost else { return }
+                guard let self = self, self.settings.isRunning else { return }
                 print("⚙️ Settings updated: \(bitrate)Mbps, \(quality)")
                 self.screenCapture?.updateEncoderSettings(
-                    bitrateMbps: bitrate,
+                    bitrateMbps: self.encoderBitrate(for: bitrate),
                     quality: quality,
-                    gamingBoost: false
+                    gamingBoost: self.settings.gamingBoost
                 )
             }
             .store(in: &cancellables)
@@ -276,6 +303,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // while dragging — restart once the value settles. The effective-rate
         // guard skips no-op restarts (drag ends back on the applied value, or
         // Gaming Boost is pinning the rate to 120).
+        settings.$encodeThroughputCap
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    self.restartRunningServer(reason: "Encode throughput cap toggled")
+                }
+            }
+            .store(in: &cancellables)
+
         settings.$refreshRate
             .dropFirst()
             .removeDuplicates()
@@ -563,7 +601,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try virtualDisplayManager?.createDisplay(
                 width: size.width,
                 height: size.height,
-                refreshRate: settings.refreshRate,
+                refreshRate: settings.effectiveRefreshRate,
                 hiDPI: settings.hiDPI,
                 name: "SideScreen"
             )
@@ -603,6 +641,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Setup capture
             guard let displayID = virtualDisplayManager?.displayID else { return }
             screenCapture = try await ScreenCapture()
+            screenCapture?.throughputCapEnabled = settings.encodeThroughputCap
             screenCapture?.onCaptureMethodChanged = { [weak self] method in
                 guard let self = self else { return }
                 debugLog("Capture method: \(method)")
@@ -615,6 +654,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Setup server
             streamingServer = StreamingServer(port: settings.port)
+            if settings.usbDirectEnabled {
+                streamingServer?.enableUSBDirect()
+            }
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
@@ -638,9 +680,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+                // Re-apply encoder settings for this client's transport: caps
+                // the bitrate for wireless clients, restores the user value
+                // when a USB client takes over. Live property update — no
+                // session recreation, no stream gap.
+                let ceiling = self.encoderBitrate(for: self.settings.effectiveBitrate)
+                self.screenCapture?.updateEncoderSettings(
+                    bitrateMbps: ceiling,
+                    quality: self.settings.effectiveQuality,
+                    gamingBoost: self.settings.gamingBoost
+                )
+                let v2 = self.streamingServer?.clientUsesV2 ?? false
+                // v2 clients: request-based IDR (no periodic keyframe burst)
+                // and adaptive bitrate against the send-congestion signal.
+                self.screenCapture?.setRequestBasedKeyframes(v2)
+                if v2 {
+                    self.streamingServer?.configureAdaptiveBitrate(ceilingMbps: ceiling)
+                }
                 Task { @MainActor in
                     self.settings.clientConnected = true
                 }
+            }
+            streamingServer?.onBitrateSuggestion = { [weak self] mbps in
+                self?.screenCapture?.setLiveBitrate(mbps: mbps)
             }
             // Runs synchronously on the server's network queue BEFORE the
             // display config is sent, so the config below carries the right
